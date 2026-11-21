@@ -106,6 +106,9 @@ def run_pipeline(
             file_to_tests=selector.file_to_tests,
             fixture_to_tests=selector.fixture_to_tests,
             tpcds_plan_hashes=selector.tpcds_plan_hashes,
+            tpcds_exec_lines=selector.tpcds_exec_lines,
+            tpcds_exec_qualnames=selector.tpcds_exec_qualnames,
+            import_time_qualnames=selector.import_time_qualnames,
             tmp_base=tmp_base,
         )
     else:

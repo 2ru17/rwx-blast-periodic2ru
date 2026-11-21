@@ -27,7 +27,8 @@ class _InlineExecutor:
 
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=()):
         if initializer is not None:
-            initializer(*initargs)
+            p_init, p_args = pickle.loads(pickle.dumps((initializer, initargs)))
+            p_init(*p_args)
 
     def submit(self, fn, /, *args, **kwargs):
         future: concurrent.futures.Future[Any] = concurrent.futures.Future()
@@ -40,7 +41,16 @@ class _InlineExecutor:
         return future
 
     def map(self, fn, *iterables, timeout=None, chunksize=1):
-        return [fn(*args) for args in zip(*iterables)]
+        items = list(zip(*iterables))
+        for args in items:
+            pickle.loads(pickle.dumps((fn, args)))
+        fs = [self.submit(fn, *args) for args in items]
+
+        def _gen():
+            for fut in fs:
+                yield fut.result()
+
+        return _gen()
 
     def shutdown(self, wait=True, *, cancel_futures=False):
         return None
@@ -67,6 +77,54 @@ def encode_test_set(sorted_nums: list[int]) -> list[int | list[int]]:
         start = prev = num
     _flush_run(out, start, prev)
     return out
+
+
+def _collect_import_time_qualnames(tree: ast.Module, imp_lines: set[int]) -> list[str]:
+    """Return function/method qualnames whose direct body statements executed at import time."""
+    if not imp_lines:
+        return []
+    found: set[str] = set()
+
+    def _body_has_imp_line(stmts: list[ast.stmt], *, skip_leading_doc: bool) -> bool:
+        body = stmts
+        if (
+            skip_leading_doc
+            and body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            body = body[1:]
+        for stmt in body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            s_ln = stmt.lineno
+            e_ln = stmt.end_lineno or s_ln
+            if any(ln in imp_lines for ln in range(s_ln, e_ln + 1)):
+                return True
+        return False
+
+    def walk(stmts: list[ast.stmt], scope: list[str]) -> None:
+        for stmt in stmts:
+            if isinstance(stmt, ast.ClassDef):
+                walk(stmt.body, [*scope, stmt.name])
+            elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qn = ".".join([*scope, stmt.name])
+                if _body_has_imp_line(stmt.body, skip_leading_doc=True):
+                    found.add(qn)
+                walk(stmt.body, [*scope, stmt.name])
+            else:
+                for attr in ("body", "orelse", "finalbody"):
+                    child = getattr(stmt, attr, None)
+                    if isinstance(child, list) and child:
+                        walk(child, scope)
+                for handler in getattr(stmt, "handlers", ()):
+                    walk(handler.body, scope)
+                for case in getattr(stmt, "cases", ()):
+                    walk(case.body, scope)
+
+    walk(tree.body, [])
+    return sorted(found)
 
 
 def _flush_run(out: list[int | list[int]], start: int, end: int) -> None:
@@ -139,6 +197,23 @@ def load_test_metadata(tests_json_path: Path) -> tuple[list[dict[str, Any]], dic
     return tests, id_to_num
 
 
+_IMPORTLIB_EXEC_FUNCS = frozenset(
+    {"_find_and_load", "_find_and_load_unlocked", "_load_unlocked", "exec_module", "get_code"}
+)
+
+
+def _is_importlib_frame() -> bool:
+    frame = sys._getframe(1)
+    while frame is not None:
+        fname = frame.f_code.co_filename
+        if fname.endswith(("inspect.py", "linecache.py")):
+            return False
+        if "importlib._bootstrap" in fname and frame.f_code.co_name in _IMPORTLIB_EXEC_FUNCS:
+            return True
+        frame = frame.f_back
+    return False
+
+
 def collect_runtime_coverage_and_fixtures(
     sqlglot_dir: Path,
     id_to_num: dict[str, int],
@@ -147,6 +222,7 @@ def collect_runtime_coverage_and_fixtures(
     dict[str, set[int]],
     dict[str, set[int]],
     set[int],
+    dict[str, set[int]],
 ]:
     """Run sqlglot pytest suite under ctrace dynamic contexts and audit file opens."""
     import coverage
@@ -165,6 +241,7 @@ def collect_runtime_coverage_and_fixtures(
 
     fixture_to_tests: dict[str, set[int]] = defaultdict(set)
     source_inspecting_tests: set[int] = set()
+    source_file_to_inspecting_tests: dict[str, set[int]] = defaultdict(set)
     active_state: dict[str, int | None] = {"test_num": None}
 
     def audit_hook(event: str, args: tuple[Any, ...]) -> None:
@@ -189,7 +266,9 @@ def collect_runtime_coverage_and_fixtures(
             if rel.startswith("tests/"):
                 fixture_to_tests[rel].add(test_num)
         elif rel.startswith("sqlglot/") and rel.endswith(".py"):
-            source_inspecting_tests.add(test_num)
+            if not _is_importlib_frame():
+                source_inspecting_tests.add(test_num)
+                source_file_to_inspecting_tests[rel].add(test_num)
 
     with tempfile.TemporaryDirectory() as td:
         rc_path = os.path.join(td, ".coveragerc")
@@ -276,7 +355,13 @@ def collect_runtime_coverage_and_fixtures(
         finally:
             conn.close()
 
-    return line_to_tests, import_time_lines, fixture_to_tests, source_inspecting_tests
+    return (
+        line_to_tests,
+        import_time_lines,
+        fixture_to_tests,
+        source_inspecting_tests,
+        source_file_to_inspecting_tests,
+    )
 
 
 def _normalize_rel_path(path_str: str, root_str: str) -> str | None:
@@ -708,14 +793,95 @@ def _static_fixture_scan(
                             fixture_to_tests["tests/fixtures/jsonpath/cts.json"].add(test_num)
 
 
+def compute_source_inspecting_tests(
+    sqlglot_dir: Path,
+    id_to_num: dict[str, int],
+) -> tuple[set[int], dict[str, set[int]]]:
+    """Identify tests that read sqlglot/*.py source files outside importlib."""
+    import pytest
+
+    candidate_files: list[str] = []
+    for p in sorted((sqlglot_dir / "tests").rglob("test_*.py")):
+        src = p.read_text(encoding="utf-8", errors="replace")
+        if any(
+            k in src
+            for k in (
+                "read_text",
+                "read_bytes",
+                "getsource",
+                "getsourcelines",
+                "findsource",
+                "ast.parse",
+                "doctest",
+                "open(",
+                ".open(",
+                "linecache",
+            )
+        ):
+            candidate_files.append(p.relative_to(sqlglot_dir).as_posix())
+
+    source_inspecting_tests: set[int] = set()
+    source_file_to_inspecting_tests: dict[str, set[int]] = defaultdict(set)
+    if not candidate_files:
+        return source_inspecting_tests, source_file_to_inspecting_tests
+
+    sqlglot_root_str = str(sqlglot_dir)
+    if sys.path[0] != sqlglot_root_str:
+        sys.path.insert(0, sqlglot_root_str)
+    prev_cwd = os.getcwd()
+    os.chdir(sqlglot_root_str)
+    active_state: dict[str, int | None] = {"test_num": None}
+
+    def audit_hook(event: str, args: tuple[Any, ...]) -> None:
+        if event != "open" or not args:
+            return
+        test_num = active_state["test_num"]
+        if test_num is None:
+            return
+        path_arg = args[0]
+        if not isinstance(path_arg, (str, os.PathLike)):
+            return
+        raw_path = os.fspath(path_arg)
+        abs_path = os.path.normpath(
+            raw_path if os.path.isabs(raw_path) else os.path.join(sqlglot_root_str, raw_path)
+        )
+        prefix = sqlglot_root_str + os.sep
+        if not abs_path.startswith(prefix):
+            return
+        rel = abs_path[len(prefix) :].replace(os.sep, "/")
+        if rel.startswith("sqlglot/") and rel.endswith(".py") and not _is_importlib_frame():
+            source_inspecting_tests.add(test_num)
+            source_file_to_inspecting_tests[rel].add(test_num)
+
+    sys.addaudithook(audit_hook)
+
+    class _AuditPlugin:
+        @pytest.hookimpl(hookwrapper=True)
+        def pytest_runtest_protocol(self, item: Any, nextitem: Any) -> Any:
+            active_state["test_num"] = id_to_num.get(item.nodeid)
+            try:
+                yield
+            finally:
+                active_state["test_num"] = None
+
+    try:
+        pytest.main(["-q", "--disable-warnings", *candidate_files], plugins=[_AuditPlugin()])
+    finally:
+        os.chdir(prev_cwd)
+
+    return source_inspecting_tests, source_file_to_inspecting_tests
+
+
 def load_reused_coverage(
     reuse_dir: Path,
     sqlglot_dir: Path,
+    id_to_num: dict[str, int],
 ) -> tuple[
     dict[str, dict[int, set[int]]],
     dict[str, set[int]],
     dict[str, set[int]],
     set[int],
+    dict[str, set[int]],
 ]:
     """Load existing coverage maps and supplement ProcessPoolExecutor pickle paths."""
     import coverage
@@ -747,7 +913,9 @@ def load_reused_coverage(
     for fpath, nums in ti_raw.get("fixture_to_test_numbers", {}).items():
         fixture_to_tests[fpath].update(nums)
 
-    source_inspecting_tests = set(ti_raw.get("source_inspecting_tests", []))
+    source_inspecting_tests, source_file_to_inspecting_tests = compute_source_inspecting_tests(
+        sqlglot_dir, id_to_num
+    )
 
     pool_tests: set[int] = set()
     pool_tests.update(line_to_tests.get("tests/test_optimizer.py", {}).get(259, set()))
@@ -759,10 +927,14 @@ def load_reused_coverage(
         if sys.path[0] != sqlglot_root_str:
             sys.path.insert(0, sqlglot_root_str)
         import sqlglot
+        from sqlglot.executor.table import Table
         from sqlglot.optimizer.annotate_types import annotate_types
+        from sqlglot.schema import MappingSchema
 
         sample_expr = annotate_types(sqlglot.parse_one("SELECT CAST(1 AS INT) AS a, x FROM y /* c */"))
         sample_expr.meta["k"] = 1
+        sample_table = Table(columns=("a",), rows=[(1,)])
+        sample_schema = MappingSchema({"t": {"a": "int"}})
 
         with tempfile.TemporaryDirectory() as td:
             rc_path = os.path.join(td, ".coveragerc")
@@ -775,7 +947,7 @@ def load_reused_coverage(
             )
             cov.start()
             cov.switch_context("pickle_roundtrip")
-            _ = pickle.loads(pickle.dumps(sample_expr))
+            _ = pickle.loads(pickle.dumps((sample_expr, sample_table, sample_schema)))
             cov.stop()
             cov.save()
 
@@ -794,7 +966,13 @@ def load_reused_coverage(
             finally:
                 conn.close()
 
-    return line_to_tests, import_time_lines, fixture_to_tests, source_inspecting_tests
+    return (
+        line_to_tests,
+        import_time_lines,
+        fixture_to_tests,
+        source_inspecting_tests,
+        source_file_to_inspecting_tests,
+    )
 
 
 def _compile_plan_signature(pe: Any, plan: Any, exp_mod: Any) -> tuple[Any, ...]:
@@ -829,7 +1007,8 @@ def _compile_plan_signature(pe: Any, plan: Any, exp_mod: Any) -> tuple[Any, ...]
         src_alias = src.alias_or_name if isinstance(src, exp_mod.Expr) else str(src)
         extra: list[Any] = []
         if ntype == "Join":
-            for jname, jinfo in sorted(node.joins.items()):
+            extra.append(getattr(node, "source_name", None))
+            for jname, jinfo in node.joins.items():
                 extra.append(
                     (
                         jname,
@@ -861,7 +1040,7 @@ def _compile_plan_signature(pe: Any, plan: Any, exp_mod: Any) -> tuple[Any, ...]
                     node.distinct,
                 )
             )
-        deps = tuple(sorted(visit_step(d) for d in node.dependencies))
+        deps = tuple(sorted((visit_step(d) for d in node.dependencies), key=repr))
         res = (
             ntype,
             node.name,
@@ -879,10 +1058,17 @@ def _compile_plan_signature(pe: Any, plan: Any, exp_mod: Any) -> tuple[Any, ...]
         return res
 
     root_sig = visit_step(plan.root)
-    sub_sigs = []
-    for sq_name in sorted(list(pe._subquery_plans.keys())):
-        sq_plan, _ = pe._subquery_plans[sq_name]
-        sub_sigs.append((sq_name, visit_step(sq_plan.root)))
+    sub_sigs: list[tuple[str, tuple[Any, ...]]] = []
+    visited_sq: set[str] = set()
+    while True:
+        pending = sorted(k for k in pe._subquery_plans if k not in visited_sq)
+        if not pending:
+            break
+        for sq_name in pending:
+            visited_sq.add(sq_name)
+            sq_plan, _ = pe._subquery_plans[sq_name]
+            sub_sigs.append((sq_name, visit_step(sq_plan.root)))
+    sub_sigs.sort(key=lambda item: item[0])
     return (root_sig, tuple(sub_sigs))
 
 
@@ -914,11 +1100,123 @@ def compute_tpcds_plan_hashes(sqlglot_dir: Path) -> list[str]:
             opt_expr = optimize(p_expr, schema_, leave_tables_isolated=True, dialect=None)
             plan = Plan(opt_expr)
             pe = PythonExecutor()
+            pe._ctes = plan.ctes
             plan_sig = _compile_plan_signature(pe, plan, exp)
+            opt_sql_pretty = opt_expr.sql(pretty=True)
             duck_sql = transpile(sql, write="duckdb")[0]
-            payload = repr((sql, tables, opt_expr.sql(), plan_sig, duck_sql)).encode("utf-8")
+            payload = repr((sql, tables, opt_sql_pretty, plan_sig, duck_sql)).encode("utf-8")
             sigs.append(hashlib.sha256(payload).hexdigest()[:32])
         return sigs
+    finally:
+        os.chdir(prev_cwd)
+
+
+def compute_tpcds_execute_coverage(sqlglot_dir: Path) -> dict[str, list[int | list[int]]]:
+    """Trace exact post-plan execute() coverage across executable TPC-DS queries using ctrace."""
+    import csv
+    import coverage
+    from coverage.numbits import numbits_to_nums
+
+    os.environ.pop("COVERAGE_CORE", None)
+    sqlglot_root_str = str(sqlglot_dir)
+    if sys.path[0] != sqlglot_root_str:
+        sys.path.insert(0, sqlglot_root_str)
+    prev_cwd = os.getcwd()
+    os.chdir(sqlglot_root_str)
+    try:
+        from sqlglot import find_tables, parse_one
+        from sqlglot.executor.python import PythonExecutor
+        from sqlglot.executor.table import Table, ensure_tables
+        from sqlglot.optimizer import optimize
+        from sqlglot.planner import Plan
+        from sqlglot.schema import ensure_schema
+        from tests.helpers import TPCDS_SCHEMA, load_sql_fixture_pairs
+        from tests.test_executor import DIR_TPCDS, open_file
+
+        loaded_tables: dict[str, Table] = {}
+        for table_name, columns in TPCDS_SCHEMA.items():
+            file_name = f"{DIR_TPCDS}{table_name}.csv.gz"
+            reader = csv.reader(open_file(file_name), delimiter="|")
+            rows: list[Any] = []
+            ctypes: list[Any] = []
+            next(reader)
+            for row in reader:
+                if not ctypes:
+                    for v in row:
+                        try:
+                            ctypes.append(type(ast.literal_eval(v)))
+                        except (ValueError, SyntaxError):
+                            ctypes.append(str)
+                rows.append(
+                    tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row))
+                )
+            loaded_tables[table_name] = Table(columns=columns, rows=rows)
+
+        sqls = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+        prep_schema = ensure_schema(TPCDS_SCHEMA, dialect=None)
+
+        prepared = []
+        for meta, sql, _ in sqls:
+            if not meta.get("execute"):
+                continue
+            expr = parse_one(sql)
+            q_tables = {t.name: loaded_tables[t.name] for t in find_tables(expr)}
+            opt_expr = optimize(expr, prep_schema, leave_tables_isolated=True, dialect=None)
+            prepared.append((opt_expr, Plan(opt_expr), q_tables))
+
+        with tempfile.TemporaryDirectory() as td:
+            rc_path = os.path.join(td, ".coveragerc")
+            data_path = os.path.join(td, ".coverage")
+            Path(rc_path).write_text("[run]\ncore = ctrace\nbranch = False\n", encoding="utf-8")
+            cov = coverage.Coverage(
+                config_file=rc_path,
+                data_file=data_path,
+                include=[f"{sqlglot_root_str}/sqlglot/*", f"{sqlglot_root_str}/tests/*"],
+            )
+            cov.start()
+            collector_repr = repr(cov._collector)
+            if "CTracer" not in collector_repr:
+                cov.stop()
+                raise RuntimeError(f"Expected CTracer coverage core, got: {collector_repr}")
+            cov.switch_context("tpcds_execute_phase")
+            try:
+                fresh_schema = ensure_schema(TPCDS_SCHEMA, dialect=None)
+                p_schema, p_tables = pickle.loads(pickle.dumps((TPCDS_SCHEMA, loaded_tables)))
+                _ = p_schema
+                for opt_expr, plan, q_tables in prepared:
+                    tables_ = ensure_tables({k: p_tables[k] for k in q_tables}, dialect=None)
+                    _ = (
+                        tables_.supported_table_args
+                        and tables_.supported_table_args != fresh_schema.supported_table_args
+                    )
+                    _ = opt_expr.sql(pretty=True)
+                    _ = str(plan)
+                    res_table = PythonExecutor(tables=tables_).execute(plan)
+                    _ = pickle.loads(pickle.dumps(res_table))
+            finally:
+                cov.stop()
+                cov.save()
+
+            cov_lines: dict[str, set[int]] = defaultdict(set)
+            conn = sqlite3.connect(data_path)
+            try:
+                fmap = {
+                    row[0]: _normalize_rel_path(row[1], sqlglot_root_str)
+                    for row in conn.execute("SELECT id, path FROM file")
+                }
+                for fid, numbits in conn.execute("SELECT file_id, numbits FROM line_bits"):
+                    rel_f = fmap.get(fid)
+                    if not rel_f:
+                        continue
+                    cov_lines[rel_f].update(numbits_to_nums(numbits))
+            finally:
+                conn.close()
+
+        return {
+            rel: encode_test_set(sorted(lines))
+            for rel, lines in sorted(cov_lines.items())
+            if lines
+        }
     finally:
         os.chdir(prev_cwd)
 
@@ -935,13 +1233,21 @@ def build_maps(
     tests, id_to_num = load_test_metadata(tests_json_path)
 
     if reuse_coverage_from is not None:
-        line_to_tests, import_time_lines, fixture_to_tests, source_inspecting_tests = (
-            load_reused_coverage(reuse_coverage_from, sqlglot_dir)
-        )
+        (
+            line_to_tests,
+            import_time_lines,
+            fixture_to_tests,
+            source_inspecting_tests,
+            source_file_to_inspecting_tests,
+        ) = load_reused_coverage(reuse_coverage_from, sqlglot_dir, id_to_num)
     else:
-        line_to_tests, import_time_lines, fixture_to_tests, source_inspecting_tests = (
-            collect_runtime_coverage_and_fixtures(sqlglot_dir, id_to_num)
-        )
+        (
+            line_to_tests,
+            import_time_lines,
+            fixture_to_tests,
+            source_inspecting_tests,
+            source_file_to_inspecting_tests,
+        ) = collect_runtime_coverage_and_fixtures(sqlglot_dir, id_to_num)
 
     py_files = iter_python_files(sqlglot_dir)
     mod_to_file = resolve_module_index(py_files)
@@ -1098,22 +1404,35 @@ def build_maps(
             line_to_set[rel] = ln_dict
 
     qualname_to_set: dict[str, dict[str, int]] = {}
+    import_time_qualnames: dict[str, list[str]] = {}
     file_to_set: dict[str, int] = {}
     ast_index_out: dict[str, Any] = {}
 
-    for rel, _ in py_files:
+    for rel, path in py_files:
         col = collectors[rel]
         ln_map = line_to_tests.get(rel, {})
-        qn_sets: dict[str, int] = {}
+        qn_tsets: dict[str, set[int]] = defaultdict(set)
         for qn, _kind, start, end in col.symbols:
-            tset: set[int] = set()
             for ln in range(start, end + 1):
-                tset.update(ln_map.get(ln, ()))
+                qn_tsets[qn].update(ln_map.get(ln, ()))
+        qn_sets: dict[str, int] = {}
+        for qn, tset in sorted(qn_tsets.items()):
             sid = interner.intern(tset)
             if sid != 0:
                 qn_sets[qn] = sid
         if qn_sets:
             qualname_to_set[rel] = qn_sets
+
+        imp_for_file = import_time_lines.get(rel)
+        if imp_for_file:
+            src_text = path.read_text(encoding="utf-8", errors="replace")
+            try:
+                f_tree = ast.parse(src_text, filename=rel)
+                imp_qns = _collect_import_time_qualnames(f_tree, imp_for_file)
+                if imp_qns:
+                    import_time_qualnames[rel] = imp_qns
+            except SyntaxError:
+                pass
 
         fsid = interner.intern(file_to_tests.get(rel, ()))
         if fsid != 0:
@@ -1222,6 +1541,7 @@ def build_maps(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     tpcds_plan_hashes = compute_tpcds_plan_hashes(sqlglot_dir)
+    tpcds_exec_lines = compute_tpcds_execute_coverage(sqlglot_dir)
 
     test_index_data = {
         "sqlglot_commit": sqlglot_commit,
@@ -1231,7 +1551,11 @@ def build_maps(
             k: sorted(v) for k, v in sorted(fixture_to_tests.items())
         },
         "source_inspecting_tests": sorted(source_inspecting_tests),
+        "source_file_to_inspecting_tests": {
+            k: sorted(v) for k, v in sorted(source_file_to_inspecting_tests.items())
+        },
         "tpcds_plan_hashes": tpcds_plan_hashes,
+        "tpcds_exec_lines": tpcds_exec_lines,
     }
 
     coverage_map_data = {
@@ -1240,6 +1564,7 @@ def build_maps(
         "import_time_lines": {
             k: sorted(v) for k, v in sorted(import_time_lines.items()) if v
         },
+        "import_time_qualnames": dict(sorted(import_time_qualnames.items())),
         "qualname_to_set": qualname_to_set,
         "file_to_set": file_to_set,
     }

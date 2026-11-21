@@ -1,4 +1,4 @@
-"""Generate 32 unseen adversarial synthetic commits against sqlglot@eb11aec and compute ground truth."""
+"""Generate 34 unseen adversarial synthetic commits against sqlglot@eb11aec and compute ground truth."""
 
 from __future__ import annotations
 
@@ -29,9 +29,12 @@ from verifier import (  # noqa: E402
     _fast_verify_tpcds,
     _InlinePickleExecutor,
     _install_lazy_heavy_deps,
+    _is_fixture_path,
     _LazyOptimizerConn,
     _SubtestAbort,
+    _TEST_INFRA_FILES,
     _TPC_EXECUTOR_METHODS,
+    can_fast_verify_tpcds,
     create_overlay,
     redirect_preloaded_modules_to_overlay,
 )
@@ -362,6 +365,46 @@ def build_synthetic_patches(sqlglot_root: Path) -> dict[str, str]:
         "def dump(expression: exp.Expr) -> list[dict[str, t.Any]]:\n    return []",
     )
 
+    # 33. Adversarial helper mutation outside sqlglot/executor/ called inside execute()
+    # Leaves optimize()/Plan()/golden TPC-DS plans unchanged, but breaks ensure_tables() -> #1106
+    patches["s33_tpcds_execute_helper_mutation"] = replace_once(
+        "sqlglot/helper.py",
+        read("sqlglot/helper.py"),
+        '        # d doesn\'t have attribute "values"\n        return 0',
+        '        # d doesn\'t have attribute "values"\n        return 1 if type(d).__name__ == "Table" else 0',
+    )
+
+    # 34. Adversarial StrEnum/AutoName raw str override in subclass paired with is -> ==
+    p34_dialect = replace_once(
+        "sqlglot/dialects/dialect.py",
+        read("sqlglot/dialects/dialect.py"),
+        "self.normalization_strategy is NormalizationStrategy.UPPERCASE",
+        "self.normalization_strategy == NormalizationStrategy.UPPERCASE",
+    )
+    p34_sf = replace_once(
+        "sqlglot/dialects/snowflake.py",
+        read("sqlglot/dialects/snowflake.py"),
+        "    NORMALIZATION_STRATEGY = NormalizationStrategy.UPPERCASE",
+        '    NORMALIZATION_STRATEGY = "UPPERCASE"',
+    )
+    patches["s34_strenum_raw_str_subclass_unsafe_is_to_eq"] = p34_dialect + p34_sf
+
+    # 35. Adversarial edit inside duplicate @property getter (Expression.type vs @type.setter)
+    patches["s35_duplicate_property_getter_mutation"] = replace_once(
+        "sqlglot/expressions/core.py",
+        read("sqlglot/expressions/core.py"),
+        "        if self.is_cast:\n            return self._type or self.to  # type: ignore[attr-defined]\n        return self._type",
+        "        if self.is_cast:\n            return self._type or self.to  # type: ignore[attr-defined]\n        return None",
+    )
+
+    # 36. Adversarial edit inside import-time-executed Expr.__init_subclass__
+    patches["s36_import_time_init_subclass_mutation"] = replace_once(
+        "sqlglot/expressions/core.py",
+        read("sqlglot/expressions/core.py"),
+        "        cls.key = cls.__name__.lower()",
+        '        if cls.__name__ == "Select":\n            raise RuntimeError("synthetic __init_subclass__ failure")\n        cls.key = cls.__name__.lower()',
+    )
+
     return patches
 
 
@@ -371,6 +414,7 @@ def _eval_tests_in_fork(
     test_specs: list[tuple[int, str]],
     tpcds_plan_hashes: tuple[str, ...],
     timeout_s: float = 4.0,
+    allow_fast_tpcds: bool = True,
 ) -> tuple[set[int], set[str], bool]:
     """Run test_specs in an isolated forked child without #1106 heavy-first abort shortcut."""
     if not test_specs:
@@ -402,7 +446,10 @@ def _eval_tests_in_fork(
 
             by_file_cls: dict[str, dict[str, list[tuple[int, str, str]]]] = {}
             for tnum, tid in test_specs:
-                if tid == "tests/test_executor.py::TestExecutor::test_execute_tpcds":
+                if (
+                    allow_fast_tpcds
+                    and tid == "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+                ):
                     try:
                         if _fast_verify_tpcds(tpcds_plan_hashes, soft_deadline):
                             passed.append(tnum)
@@ -418,11 +465,13 @@ def _eval_tests_in_fork(
                 )
 
             patched_files = frozenset(patched_contents.keys())
-            can_filter_exec = (
-                "tests/test_executor.py" not in patched_files
-                and "tests/helpers.py" not in patched_files
+            test_infra_modified = any(
+                p in _TEST_INFRA_FILES or _is_fixture_path(p) for p in patched_files
             )
-            can_lazy_opt = "tests/test_optimizer.py" not in patched_files
+            can_filter_exec = (
+                not test_infra_modified and "sqlglot/executor/table.py" not in patched_files
+            )
+            can_lazy_opt = not test_infra_modified
 
             for tfile in sorted(by_file_cls):
                 if time.monotonic() >= soft_deadline:
@@ -622,6 +671,13 @@ def compute_ground_truth(
                 )
                 continue
 
+        allow_fast_tpcds = can_fast_verify_tpcds(
+            analysis,
+            tpcds_plan_hashes=selector.tpcds_plan_hashes,
+            tpcds_exec_lines=selector.tpcds_exec_lines,
+            tpcds_exec_qualnames=selector.tpcds_exec_qualnames,
+            import_time_qualnames=selector.import_time_qualnames,
+        )
         failed_nums: set[int] = set()
         for tfile, specs in sorted(by_file.items()):
             passed_nums, imp_errs, _timed_out = _eval_tests_in_fork(
@@ -629,7 +685,8 @@ def compute_ground_truth(
                 analysis.patched_contents,
                 specs,
                 selector.tpcds_plan_hashes,
-                timeout_s=2.0 if "timeout" in cid else 45.0,
+                timeout_s=2.0 if "timeout" in cid else 60.0,
+                allow_fast_tpcds=allow_fast_tpcds,
             )
             if tfile in imp_errs:
                 failed_nums.update(selector.file_to_tests.get(tfile, ()))

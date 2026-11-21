@@ -83,6 +83,9 @@ class BlastSelector:
         self.import_time_lines: dict[str, frozenset[int]] = {
             rel: frozenset(lns) for rel, lns in cov_map.get("import_time_lines", {}).items()
         }
+        self.import_time_qualnames: dict[str, frozenset[str]] = {
+            rel: frozenset(qns) for rel, qns in cov_map.get("import_time_qualnames", {}).items()
+        }
         self.qualname_to_set: dict[str, dict[str, int]] = cov_map["qualname_to_set"]
         self.file_to_set: dict[str, int] = cov_map["file_to_set"]
         self.ast_index: dict[str, Any] = ast_index
@@ -100,9 +103,31 @@ class BlastSelector:
         self.source_inspecting_tests: frozenset[int] = frozenset(
             test_index.get("source_inspecting_tests", ())
         )
+        self.source_file_to_inspecting_tests: dict[str, frozenset[int]] = {
+            rel: frozenset(nums)
+            for rel, nums in test_index.get("source_file_to_inspecting_tests", {}).items()
+        }
+        mapped_inspecting: set[int] = set()
+        for nums in self.source_file_to_inspecting_tests.values():
+            mapped_inspecting.update(nums)
+        self.unmapped_source_inspecting_tests: frozenset[int] = (
+            self.source_inspecting_tests - mapped_inspecting
+        )
         self.tpcds_plan_hashes: tuple[str, ...] = tuple(
             test_index.get("tpcds_plan_hashes", ())
         )
+        self.tpcds_exec_lines: dict[str, frozenset[int]] = {
+            rel: _decode_set(enc)
+            for rel, enc in test_index.get("tpcds_exec_lines", {}).items()
+        }
+        self.tpcds_exec_qualnames: dict[str, frozenset[str]] = {}
+        for rel, exec_lines in self.tpcds_exec_lines.items():
+            f_ast = self.ast_index.get(rel, {})
+            self.tpcds_exec_qualnames[rel] = frozenset(
+                qn
+                for qn, kind, start, end in f_ast.get("symbols", ())
+                if kind in ("function", "method") and any(start <= ln <= end for ln in exec_lines)
+            )
 
         self.id_by_num: dict[int, str] = {}
         self.num_by_id: dict[str, int] = {}
@@ -253,6 +278,10 @@ class BlastSelector:
         out: set[int] = set()
         if rel.startswith("sqlglot/typing/") and self.typing_meta_test is not None:
             out.add(self.typing_meta_test)
+        if fa.raw_text_changed:
+            out.update(self.source_file_to_inspecting_tests.get(rel, ()))
+            if self.unmapped_source_inspecting_tests:
+                out.update(self.unmapped_source_inspecting_tests & self._file_runtime_tests(rel))
         if fa.docstring_changed:
             file_tests = self._file_runtime_tests(rel)
             out.update(self.source_inspecting_tests & file_tests)
@@ -317,11 +346,16 @@ class BlastSelector:
         ln_map = self.line_to_set.get(rel, {})
         qn_map = self.qualname_to_set.get(rel, {})
         imp_lines = self.import_time_lines.get(rel, frozenset())
+        imp_qns = self.import_time_qualnames.get(rel, frozenset())
         f_ast = self.ast_index.get(rel, {})
         fam_tests = self._dialect_family_tests(rel)
 
-        sym_spans = {qn: (s, e) for qn, _k, s, e in f_ast.get("symbols", ())}
-        changed_func_spans = [sym_spans[qn] for qn in fa.changed_qualnames if qn in sym_spans]
+        sym_spans: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        for qn, _k, s, e in f_ast.get("symbols", ()):
+            sym_spans[qn].append((s, e))
+        changed_func_spans = [
+            span for qn in fa.changed_qualnames for span in sym_spans.get(qn, ())
+        ]
         mapped_attr_spans: list[tuple[int, int]] = []
         for ac in fa.attr_changes:
             info = (
@@ -411,21 +445,65 @@ class BlastSelector:
             else:
                 out.update(self._file_runtime_tests(rel))
 
-        # Fall back to enclosing symbol coverage when edits hit signatures, decorators, or uncovered lines.
+        # Fall back to enclosing symbol coverage when edits hit signatures, decorators, or uncovered lines,
+        # and expand to transitive importers when a function whose body runs at import time changes.
         for qn in fa.changed_qualnames:
+            spans = sym_spans.get(qn, ())
+            if qn in imp_qns:
+                child_non_imp_spans = [
+                    sp
+                    for other in fa.changed_qualnames
+                    if other != qn and other.startswith(qn + ".") and other not in imp_qns
+                    for sp in sym_spans.get(other, ())
+                ]
+                direct_lines = [
+                    ln
+                    for ln in (fa.changed_old_lines or fa.expanded_old_lines)
+                    if any(s_ln <= ln <= e_ln for s_ln, e_ln in spans)
+                ]
+                only_inside_non_imp_child = bool(direct_lines) and bool(child_non_imp_spans) and all(
+                    any(cs <= ln <= ce for cs, ce in child_non_imp_spans) for ln in direct_lines
+                )
+                if not only_inside_non_imp_child:
+                    out.update(self._transitive_tests(rel))
+                    out.update(self._file_runtime_tests(rel))
+                    out.update(fam_tests)
+
             sid = qn_map.get(qn, 0)
             if not sid:
+                if any(
+                    ln in imp_lines
+                    for ln in fa.changed_old_lines
+                    for s_ln, e_ln in spans
+                    if s_ln <= ln <= e_ln
+                ):
+                    out.update(self._transitive_tests(rel))
+                    out.update(self._file_runtime_tests(rel))
+                    out.update(fam_tests)
                 continue
-            span = sym_spans.get(qn)
-            if span is None:
+            if not spans:
                 out.update(self.sets[sid])
                 continue
-            s_ln, e_ln = span
-            in_sym_changed = [ln for ln in fa.expanded_old_lines if s_ln <= ln <= e_ln]
-            hit_covered_runtime = any(ln in ln_map and ln not in imp_lines for ln in in_sym_changed)
-            hit_header_or_imp = any(ln == s_ln or ln in imp_lines for ln in fa.changed_old_lines if s_ln <= ln <= e_ln)
-            if not hit_covered_runtime or hit_header_or_imp:
-                out.update(self.sets[sid])
+            for s_ln, e_ln in spans:
+                in_sym_changed = [ln for ln in fa.expanded_old_lines if s_ln <= ln <= e_ln]
+                if not in_sym_changed:
+                    continue
+                hit_covered_runtime = any(ln in ln_map and ln not in imp_lines for ln in in_sym_changed)
+                hit_header_or_imp = any(
+                    ln == s_ln or ln in imp_lines
+                    for ln in fa.changed_old_lines
+                    if s_ln <= ln <= e_ln
+                )
+                if not hit_covered_runtime or hit_header_or_imp:
+                    out.update(self.sets[sid])
+                    break
+
+        if fa.raw_text_changed:
+            out.update(self.source_file_to_inspecting_tests.get(rel, ()))
+            if self.unmapped_source_inspecting_tests:
+                out.update(self.unmapped_source_inspecting_tests & self._file_runtime_tests(rel))
+            if rel.startswith("sqlglot/typing/") and self.typing_meta_test is not None:
+                out.add(self.typing_meta_test)
 
         return out
 

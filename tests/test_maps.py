@@ -131,3 +131,26 @@ def test_class_attribute_and_lambda_mapping() -> None:
         ]
     )
     assert id_to_num["tests/dialects/test_dremio.py::TestDremio::test_regexp_split"] in dremio_dk
+
+
+def test_tpcds_execute_coverage_and_source_inspecting_maps() -> None:
+    test_index, _, _, _ = _load_maps()
+    id_to_num = {t["id"]: t["number"] for t in test_index["tests"]}
+
+    tpcds_exec = test_index["tpcds_exec_lines"]
+    for required in (
+        "sqlglot/executor/python.py",
+        "sqlglot/executor/env.py",
+        "sqlglot/executor/context.py",
+        "sqlglot/executor/table.py",
+        "sqlglot/helper.py",
+        "sqlglot/schema.py",
+    ):
+        assert required in tpcds_exec and tpcds_exec[required], f"Missing {required} in tpcds_exec_lines"
+    assert 385 in _decode_set(tpcds_exec["sqlglot/helper.py"])
+
+    typing_test = id_to_num["tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata"]
+    assert test_index["source_inspecting_tests"] == [typing_test]
+    src_map = test_index["source_file_to_inspecting_tests"]
+    assert typing_test in src_map["sqlglot/typing/bigquery.py"]
+    assert typing_test in src_map["sqlglot/typing/snowflake.py"]

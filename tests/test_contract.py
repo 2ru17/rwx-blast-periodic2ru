@@ -12,6 +12,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
 MAPS_DIR = REPO_ROOT / "maps"
+SQLGLOT_ROOT = REPO_ROOT.parent / "ai-notes" / "sqlglot"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
@@ -21,8 +22,9 @@ from scheduler import compute_commit_cost_ms, duration_ms, schedule_tests  # noq
 from selector import BlastSelector  # noqa: E402
 from verifier import (  # noqa: E402
     _FailFastResult,
+    _InlinePickleExecutor,
     _SubtestAbort,
-    can_skip_pickle_roundtrip,
+    can_fast_verify_tpcds,
     can_use_preloaded_sqlglot,
     can_use_preloaded_test_dialect,
     create_overlay,
@@ -545,6 +547,119 @@ def test_sound_static_semantic_equivalence_and_adversarial_guards(tmp_path: Path
     an_ext = analyze_patch("ext", p_ext, repo)
     assert an_ext.files[0].is_ast_noop is False
 
+    # 7. Adversarial: @dataclass synthesizes __eq__, metaclass may override __eq__, subclass overrides __eq__
+    extra_src = textwrap.dedent(
+        """\
+        from dataclasses import dataclass
+        from enum import Enum, auto
+
+        class StrMode(str, Enum):
+            FAST = "FAST"
+            SAFE = "SAFE"
+
+        @dataclass
+        class DataBox:
+            x: int = 1
+
+        class MetaEq(type):
+            def __eq__(cls, other):
+                return True
+
+        class MetaBox(metaclass=MetaEq):
+            pass
+
+        class ParentBox:
+            pass
+
+        class ChildBadBox(ParentBox):
+            def __eq__(self, other):
+                return True
+
+        class ExtraWorker:
+            MODE = StrMode.FAST
+
+            def __init__(self):
+                self._dc: DataBox | None = None
+                self._mb: MetaBox | None = None
+                self._pb: ParentBox | None = None
+                self.sm = self.MODE
+
+            def set_all(self):
+                self._dc = DataBox()
+                self._mb = MetaBox()
+                self._pb = ParentBox()
+
+            def check_dc(self) -> bool:
+                return self._dc is None
+
+            def check_mb(self) -> bool:
+                return self._mb is None
+
+            def check_pb(self) -> bool:
+                return self._pb is None
+
+            def check_sm(self) -> bool:
+                return self.sm is StrMode.FAST
+        """
+    )
+    (repo / "pkg" / "extra.py").write_text(extra_src, encoding="utf-8")
+
+    def make_extra_patch(old_line: str, new_line: str) -> str:
+        lines = extra_src.splitlines()
+        idx = next(i for i, line in enumerate(lines, start=1) if old_line in line)
+        return (
+            f"diff --git a/pkg/extra.py b/pkg/extra.py\n"
+            f"--- a/pkg/extra.py\n"
+            f"+++ b/pkg/extra.py\n"
+            f"@@ -{idx},1 +{idx},1 @@\n"
+            f"-{lines[idx - 1]}\n"
+            f"+{lines[idx - 1].replace(old_line, new_line)}\n"
+        )
+
+    assert analyze_patch("dc", make_extra_patch("return self._dc is None", "return self._dc == None"), repo).files[0].is_ast_noop is False
+    assert analyze_patch("mb", make_extra_patch("return self._mb is None", "return self._mb == None"), repo).files[0].is_ast_noop is False
+    assert analyze_patch("pb", make_extra_patch("return self._pb is None", "return self._pb == None"), repo).files[0].is_ast_noop is False
+
+    # Closed-world (str, Enum): safe only while NO file assigns raw str to MODE or .sm
+    p_sm = make_extra_patch("return self.sm is StrMode.FAST", "return self.sm == StrMode.FAST")
+    assert analyze_patch("sm_closed", p_sm, repo).files[0].is_ast_noop is True
+
+    # Adding a subclass in another file setting MODE = "FAST" (raw str) MUST reject equivalence
+    (repo / "pkg" / "sub.py").write_text(
+        'from pkg.extra import ExtraWorker\nclass SubWorker(ExtraWorker):\n    MODE = "FAST"\n',
+        encoding="utf-8",
+    )
+    assert analyze_patch("sm_raw_str", p_sm, repo).files[0].is_ast_noop is False
+
+    # 8. Source-inspecting test preservation under AST/comment/semantic-equiv no-op
+    selector = BlastSelector(MAPS_DIR)
+    (repo / "sqlglot" / "typing").mkdir(parents=True)
+    typ_src = (
+        "from enum import Enum\n"
+        "class M(Enum):\n"
+        "    A = 1\n"
+        "class W:\n"
+        "    def __init__(self):\n"
+        "        self.m = M.A\n"
+        "    def f(self):\n"
+        "        return self.m is M.A\n"
+    )
+    (repo / "sqlglot" / "typing" / "bigquery.py").write_text(typ_src, encoding="utf-8")
+    typ_patch = (
+        "diff --git a/sqlglot/typing/bigquery.py b/sqlglot/typing/bigquery.py\n"
+        "--- a/sqlglot/typing/bigquery.py\n"
+        "+++ b/sqlglot/typing/bigquery.py\n"
+        "@@ -8,1 +8,1 @@\n"
+        "-        return self.m is M.A\n"
+        "+        return self.m == M.A\n"
+    )
+    an_typ = analyze_patch("typ_equiv", typ_patch, repo)
+    assert an_typ.files[0].is_ast_noop is True
+    assert an_typ.files[0].raw_text_changed is True
+    sel_typ = selector.select(an_typ)
+    assert selector.typing_meta_test is not None
+    assert selector.typing_meta_test in sel_typ.candidates
+
 
 def test_two_tier_fork_server_and_overlay_redirection(tmp_path: Path) -> None:
     import shutil
@@ -600,7 +715,6 @@ def test_two_tier_fork_server_and_overlay_redirection(tmp_path: Path) -> None:
     )
     assert can_use_preloaded_sqlglot(an_leaf_fail, repo) is True
     assert can_use_preloaded_test_dialect(an_leaf_fail) is True
-    assert can_skip_pickle_roundtrip(an_leaf_fail) is True
 
     an_leaf_pass = analyze_patch(
         "c_leaf_pass",
@@ -648,3 +762,621 @@ def test_two_tier_fork_server_and_overlay_redirection(tmp_path: Path) -> None:
     assert outcomes["c_leaf_pass"].final_tests == frozenset()
     assert "sqlglot" not in sys.modules
     assert list(tmp_ov.iterdir()) == []
+
+
+def test_fast_verify_tpcds_and_setup_and_pickle_guards(tmp_path: Path) -> None:
+    repo = tmp_path / "tpcds_guard_repo"
+    (repo / "sqlglot" / "optimizer").mkdir(parents=True)
+    (repo / "tests" / "fixtures" / "optimizer").mkdir(parents=True)
+    (repo / "sqlglot" / "helper.py").write_text(
+        "def unused_fn(x):\n    return x + 1\n\ndef dict_depth(d):\n    try:\n        return 1\n    except AttributeError:\n        return 0\n",
+        encoding="utf-8",
+    )
+    (repo / "sqlglot" / "optimizer" / "canonicalize.py").write_text("def c(x):\n    return x\n", encoding="utf-8")
+    (repo / "tests" / "fixtures" / "optimizer" / "other.sql").write_text("SELECT 1;\n", encoding="utf-8")
+    (repo / "tests" / "helpers.py").write_text("X = 1\n", encoding="utf-8")
+
+    hashes = ("abc123",)
+    exec_lines = {"sqlglot/helper.py": frozenset({8})}
+    exec_qns = {"sqlglot/helper.py": frozenset({"dict_depth"})}
+
+    # Edit in executed line of helper outside sqlglot/executor/ MUST disable fast TPC-DS
+    an_exec_line = analyze_patch(
+        "exec_line",
+        "diff --git a/sqlglot/helper.py b/sqlglot/helper.py\n"
+        "--- a/sqlglot/helper.py\n"
+        "+++ b/sqlglot/helper.py\n"
+        "@@ -8,1 +8,1 @@\n"
+        "-        return 0\n"
+        "+        return 1\n",
+        repo,
+    )
+    assert can_fast_verify_tpcds(an_exec_line, hashes, exec_lines, exec_qns) is False
+
+    # Insertion in executed function header (outside exec_lines) MUST disable via exec_qualnames
+    an_exec_qn = analyze_patch(
+        "exec_qn",
+        "diff --git a/sqlglot/helper.py b/sqlglot/helper.py\n"
+        "--- a/sqlglot/helper.py\n"
+        "+++ b/sqlglot/helper.py\n"
+        "@@ -4,1 +4,2 @@\n"
+        " def dict_depth(d):\n"
+        "+    return 99\n",
+        repo,
+    )
+    assert can_fast_verify_tpcds(an_exec_qn, hashes, exec_lines, exec_qns) is False
+
+    # Any fixture or tests/helpers.py edit MUST disable fast TPC-DS
+    an_fix = analyze_patch(
+        "fix",
+        "diff --git a/tests/fixtures/optimizer/other.sql b/tests/fixtures/optimizer/other.sql\n"
+        "--- a/tests/fixtures/optimizer/other.sql\n"
+        "+++ b/tests/fixtures/optimizer/other.sql\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-SELECT 1;\n"
+        "+SELECT 2;\n",
+        repo,
+    )
+    assert can_fast_verify_tpcds(an_fix, hashes, exec_lines, exec_qns) is False
+
+    an_helpers = analyze_patch(
+        "helpers",
+        "diff --git a/tests/helpers.py b/tests/helpers.py\n"
+        "--- a/tests/helpers.py\n"
+        "+++ b/tests/helpers.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-X = 1\n"
+        "+X = 2\n",
+        repo,
+    )
+    assert can_fast_verify_tpcds(an_helpers, hashes, exec_lines, exec_qns) is False
+
+    # Missing exec_lines fails closed
+    an_ok = analyze_patch(
+        "ok",
+        "diff --git a/sqlglot/optimizer/canonicalize.py b/sqlglot/optimizer/canonicalize.py\n"
+        "--- a/sqlglot/optimizer/canonicalize.py\n"
+        "+++ b/sqlglot/optimizer/canonicalize.py\n"
+        "@@ -2,1 +2,1 @@\n"
+        "-    return x\n"
+        "+    return x\n",
+        repo,
+    )
+    an_ok2 = analyze_patch(
+        "ok2",
+        "diff --git a/sqlglot/helper.py b/sqlglot/helper.py\n"
+        "--- a/sqlglot/helper.py\n"
+        "+++ b/sqlglot/helper.py\n"
+        "@@ -2,1 +2,1 @@\n"
+        "-    return x + 1\n"
+        "+    return x + 2\n",
+        repo,
+    )
+    assert can_fast_verify_tpcds(an_ok2, hashes, {}, exec_qns) is False
+    assert can_fast_verify_tpcds(an_ok2, hashes, exec_lines, exec_qns) is True
+    assert an_ok.files[0].is_ast_noop is True
+
+    # _InlinePickleExecutor always roundtrips through pickle (rejects unpicklable local function)
+    with _InlinePickleExecutor() as pool:
+        fut = pool.submit(lambda x: x + 1, 5)
+        with pytest.raises(Exception):
+            fut.result()
+
+    # Fixture modification disables TestExecutor.setUpClass skipping and _LazyOptimizerConn
+    setup_repo = tmp_path / "setup_guard_repo"
+    (setup_repo / "tests" / "fixtures").mkdir(parents=True)
+    (setup_repo / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    (setup_repo / "tests" / "fixtures" / "a.sql").write_text("SELECT 1;\n", encoding="utf-8")
+    (setup_repo / "tests" / "test_executor.py").write_text(
+        textwrap.dedent(
+            """\
+            import unittest
+            class TestExecutor(unittest.TestCase):
+                @classmethod
+                def setUpClass(cls):
+                    raise RuntimeError("setup ran and failed")
+                def test_simple(self):
+                    self.assertTrue(True)
+            """
+        ),
+        encoding="utf-8",
+    )
+    tmp_ov = tmp_path / "setup_ov"
+    tmp_ov.mkdir()
+    an_fix_setup = CommitAnalysis(
+        "c_fix_setup",
+        patched_contents={"tests/fixtures/a.sql": "SELECT 2;\n"},
+    )
+    out_setup = verify_batch(
+        analyses={"c_fix_setup": an_fix_setup},
+        candidate_sets={"c_fix_setup": frozenset({0})},
+        sqlglot_root=setup_repo,
+        ms_by_num={0: 10},
+        id_by_num={0: "tests/test_executor.py::TestExecutor::test_simple"},
+        file_by_num={0: "tests/test_executor.py"},
+        file_to_tests={"tests/test_executor.py": frozenset({0})},
+        tmp_base=str(tmp_ov),
+        force_verify_all=True,
+    )
+    # setUpClass MUST NOT be skipped when a fixture is modified -> test_simple fails (kept!)
+    assert out_setup["c_fix_setup"].final_tests == frozenset({0})
+
+    # tearDownClass failure MUST NOT mark tests in that class as passed
+    td_repo = tmp_path / "teardown_repo"
+    (td_repo / "tests").mkdir(parents=True)
+    (td_repo / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    (td_repo / "tests" / "test_td.py").write_text(
+        textwrap.dedent(
+            """\
+            import unittest
+            class TestTD(unittest.TestCase):
+                @classmethod
+                def tearDownClass(cls):
+                    raise RuntimeError("teardown boom")
+                def test_ok(self):
+                    self.assertTrue(True)
+            """
+        ),
+        encoding="utf-8",
+    )
+    out_td = verify_batch(
+        analyses={"c_td": CommitAnalysis("c_td", patched_contents={})},
+        candidate_sets={"c_td": frozenset({0})},
+        sqlglot_root=td_repo,
+        ms_by_num={0: 10},
+        id_by_num={0: "tests/test_td.py::TestTD::test_ok"},
+        file_by_num={0: "tests/test_td.py"},
+        file_to_tests={"tests/test_td.py": frozenset({0})},
+        tmp_base=str(tmp_ov),
+        force_verify_all=True,
+    )
+    assert out_td["c_td"].final_tests == frozenset({0})
+
+    # _InlinePickleExecutor.__init__ and map() also enforce pickle roundtrip
+    with pytest.raises(Exception):
+        _InlinePickleExecutor(initializer=lambda: None)
+    with _InlinePickleExecutor() as pool:
+        with pytest.raises(Exception):
+            list(pool.map(lambda x: x + 1, [1, 2]))
+
+
+def test_diff_analyzer_soundness_regressions(tmp_path: Path) -> None:
+    repo = tmp_path / "reg_repo"
+    (repo / "pkg").mkdir(parents=True)
+    base_src = textwrap.dedent(
+        """\
+        A: int = 1
+        B = A
+
+        class SafeBox:
+            pass
+
+        class W:
+            def __init__(self, p):
+                self._b: SafeBox | None = p or None
+                self._ok: SafeBox | None = None
+
+            def make(self):
+                self._ok = SafeBox()
+
+            def check_untrusted_rhs(self) -> bool:
+                return self._b is None
+
+            def check_lambda_shadow(self):
+                x = self._ok
+                return (lambda x: x is None)(None)
+        """
+    )
+    (repo / "pkg" / "m.py").write_text(base_src, encoding="utf-8")
+
+    # 1. Added top-level function MUST NOT be treated as AST no-op
+    p_add_fn = (
+        "diff --git a/pkg/m.py b/pkg/m.py\n"
+        "--- a/pkg/m.py\n"
+        "+++ b/pkg/m.py\n"
+        "@@ -20,1 +20,4 @@\n"
+        "         return (lambda x: x is None)(None)\n"
+        "+\n"
+        "+def newly_added_top():\n"
+        "+    return 1 / 0\n"
+    )
+    an_add = analyze_patch("add_top_fn", p_add_fn, repo)
+    assert an_add.files[0].is_ast_noop is False
+    assert an_add.files[0].top_level_code_changed is True
+
+    # 2. Reordering top-level statements MUST NOT be treated as AST no-op
+    p_reorder = (
+        "diff --git a/pkg/m.py b/pkg/m.py\n"
+        "--- a/pkg/m.py\n"
+        "+++ b/pkg/m.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-A: int = 1\n"
+        "-B = A\n"
+        "+B = A\n"
+        "+A: int = 1\n"
+    )
+    an_reord = analyze_patch("reorder", p_reorder, repo)
+    assert an_reord.files[0].is_ast_noop is False
+    assert an_reord.files[0].top_level_code_changed is True
+
+    # 3. Changing AnnAssign annotation MUST NOT be treated as AST no-op
+    p_ann = (
+        "diff --git a/pkg/m.py b/pkg/m.py\n"
+        "--- a/pkg/m.py\n"
+        "+++ b/pkg/m.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-A: int = 1\n"
+        "+A: UndefinedType = 1\n"
+    )
+    an_ann = analyze_patch("ann_chg", p_ann, repo)
+    assert an_ann.files[0].is_ast_noop is False
+
+    # 4. Untrusted RHS `p or None` MUST NOT allow `is None` -> `== None`
+    p_rhs = (
+        "diff --git a/pkg/m.py b/pkg/m.py\n"
+        "--- a/pkg/m.py\n"
+        "+++ b/pkg/m.py\n"
+        "@@ -16,1 +16,1 @@\n"
+        "-        return self._b is None\n"
+        "+        return self._b == None\n"
+    )
+    assert analyze_patch("untrusted_rhs", p_rhs, repo).files[0].is_ast_noop is False
+
+    # 5. Lambda parameter shadowing `x` MUST NOT allow `is None` -> `== None`
+    p_lam = (
+        "diff --git a/pkg/m.py b/pkg/m.py\n"
+        "--- a/pkg/m.py\n"
+        "+++ b/pkg/m.py\n"
+        "@@ -20,1 +20,1 @@\n"
+        "-        return (lambda x: x is None)(None)\n"
+        "+        return (lambda x: x == None)(None)\n"
+    )
+    assert analyze_patch("lambda_shadow", p_lam, repo).files[0].is_ast_noop is False
+
+
+def test_duplicate_property_and_import_time_qualname_selection(tmp_path: Path) -> None:
+    repo = tmp_path / "dup_repo"
+    (repo / "pkg").mkdir(parents=True)
+    src = textwrap.dedent(
+        """\
+        class Item:
+            def __init__(self, v):
+                self._v = v
+
+            @property
+            def val(self):
+                return self._v
+
+            @val.setter
+            def val(self, v):
+                self._v = v
+        """
+    )
+    (repo / "pkg" / "item.py").write_text(src, encoding="utf-8")
+    p_getter = (
+        "diff --git a/pkg/item.py b/pkg/item.py\n"
+        "--- a/pkg/item.py\n"
+        "+++ b/pkg/item.py\n"
+        "@@ -7,1 +7,1 @@\n"
+        "-        return self._v\n"
+        "+        return None\n"
+    )
+    an = analyze_patch("dup_getter", p_getter, repo)
+    assert an.files[0].is_ast_noop is False
+    assert "Item.val" in an.files[0].changed_qualnames
+
+    # Live sqlglot Expression.type getter edit and Expr.__init_subclass__ edit
+    selector = BlastSelector(MAPS_DIR)
+    if SQLGLOT_ROOT.is_dir():
+        core_lines = (SQLGLOT_ROOT / "sqlglot" / "expressions" / "core.py").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        idx_type = next(
+            i
+            for i, ln in enumerate(core_lines, start=1)
+            if ln == "        return self._type" and i > 960
+        )
+        p_expr_type = (
+            "diff --git a/sqlglot/expressions/core.py b/sqlglot/expressions/core.py\n"
+            "--- a/sqlglot/expressions/core.py\n"
+            "+++ b/sqlglot/expressions/core.py\n"
+            f"@@ -{idx_type},1 +{idx_type},1 @@\n"
+            "-        return self._type\n"
+            "+        return None\n"
+        )
+        an_type = analyze_patch("expr_type_getter", p_expr_type, SQLGLOT_ROOT)
+        assert an_type.files[0].is_ast_noop is False
+        assert "Expression.type" in an_type.files[0].changed_qualnames
+        assert len(selector.select(an_type).candidates) > 50
+
+        idx_init_sub = next(
+            i
+            for i, ln in enumerate(core_lines, start=1)
+            if ln == "        cls.key = cls.__name__.lower()"
+        )
+        p_init_sub = (
+            "diff --git a/sqlglot/expressions/core.py b/sqlglot/expressions/core.py\n"
+            "--- a/sqlglot/expressions/core.py\n"
+            "+++ b/sqlglot/expressions/core.py\n"
+            f"@@ -{idx_init_sub},1 +{idx_init_sub},1 @@\n"
+            "-        cls.key = cls.__name__.lower()\n"
+            '+        cls.key = "x" + cls.__name__.lower()\n'
+        )
+        an_sub = analyze_patch("expr_init_sub", p_init_sub, SQLGLOT_ROOT)
+        assert an_sub.files[0].is_ast_noop is False
+        assert "Expr.__init_subclass__" in an_sub.files[0].changed_qualnames
+        sel_sub = selector.select(an_sub)
+        assert len(sel_sub.candidates) > 1000
+        assert not can_fast_verify_tpcds(
+            an_sub,
+            tpcds_plan_hashes=selector.tpcds_plan_hashes,
+            tpcds_exec_lines=selector.tpcds_exec_lines,
+            tpcds_exec_qualnames=selector.tpcds_exec_qualnames,
+            import_time_qualnames=selector.import_time_qualnames,
+        )
+
+
+def test_closed_world_is_eq_hardening_edge_cases(tmp_path: Path) -> None:
+    def run_case(name: str, files: dict[str, str], target_file: str, old_ln: str, new_ln: str) -> bool:
+        repo = tmp_path / name
+        for rel, content in files.items():
+            p = repo / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(textwrap.dedent(content), encoding="utf-8")
+        lines = (repo / target_file).read_text(encoding="utf-8").splitlines()
+        idx = next(i for i, ln in enumerate(lines, start=1) if old_ln in ln)
+        patch = (
+            f"diff --git a/{target_file} b/{target_file}\n"
+            f"--- a/{target_file}\n"
+            f"+++ b/{target_file}\n"
+            f"@@ -{idx},1 +{idx},1 @@\n"
+            f"-{lines[idx - 1]}\n"
+            f"+{lines[idx - 1].replace(old_ln, new_ln)}\n"
+        )
+        return analyze_patch(name, patch, repo).files[0].is_ast_noop
+
+    # 1. For-loop attribute store `for self.kind in ["a"]:` MUST reject
+    assert not run_case(
+        "for_attr_store",
+        {
+            "pkg/m.py": """\
+                from enum import Enum
+                class K(str, Enum):
+                    A = "a"
+                class W:
+                    def __init__(self):
+                        self.kind = K.A
+                    def poison(self):
+                        for self.kind in ["a"]:
+                            pass
+                    def check(self):
+                        return self.kind is K.A
+            """
+        },
+        "pkg/m.py",
+        "return self.kind is K.A",
+        "return self.kind == K.A",
+    )
+
+    # 2. Nested `nonlocal` rebinding MUST reject
+    assert not run_case(
+        "nonlocal_rebind",
+        {
+            "pkg/m.py": """\
+                from enum import Enum
+                class K(str, Enum):
+                    A = "a"
+                class W:
+                    def __init__(self):
+                        self.kind = K.A
+                    def check(self):
+                        x = self.kind
+                        def inner():
+                            nonlocal x
+                            x = "a"
+                        inner()
+                        return x is K.A
+            """
+        },
+        "pkg/m.py",
+        "return x is K.A",
+        "return x == K.A",
+    )
+
+    # 3. Conditional class-body store `if True: KIND = "a"` MUST reject
+    assert not run_case(
+        "cond_cls_body",
+        {
+            "pkg/m.py": """\
+                from enum import Enum
+                class K(str, Enum):
+                    A = "a"
+                class Base:
+                    KIND = K.A
+                    def __init__(self):
+                        self.kind = self.KIND
+                    def check(self):
+                        return self.kind is K.A
+                class Sub(Base):
+                    if True:
+                        KIND = "a"
+            """
+        },
+        "pkg/m.py",
+        "return self.kind is K.A",
+        "return self.kind == K.A",
+    )
+
+    # 4. Slice `[:]` on typed mapping extraction MUST reject
+    assert not run_case(
+        "slice_mapping_extract",
+        {
+            "pkg/m.py": """\
+                class SafeBox:
+                    pass
+                class Holder:
+                    def __init__(self, m: dict[str, SafeBox]):
+                        self.m = m
+                        self._b: SafeBox | None = None
+                    def get(self):
+                        if self._b is None:
+                            self._b = list(self.m.values())[:]
+                        return self._b
+            """
+        },
+        "pkg/m.py",
+        "if self._b is None:",
+        "if self._b == None:",
+    )
+
+    # 5. Mapping mutation `self.m.update(...)` MUST reject
+    assert not run_case(
+        "mapping_update_mut",
+        {
+            "pkg/m.py": """\
+                class SafeBox:
+                    pass
+                class Holder:
+                    def __init__(self, m: dict[str, SafeBox]):
+                        self.m = m
+                        self._b: SafeBox | None = None
+                    def poison(self, bad):
+                        self.m.update({"x": bad})
+                    def get(self):
+                        if self._b is None:
+                            self._b = list(self.m.values())[0]
+                        return self._b
+            """
+        },
+        "pkg/m.py",
+        "if self._b is None:",
+        "if self._b == None:",
+    )
+
+    # 6. Multi-dot subclass `class Sub(pkg.m.SafeBox): def __eq__` MUST reject
+    assert not run_case(
+        "multidot_sub_eq",
+        {
+            "pkg/m.py": """\
+                class SafeBox:
+                    pass
+                class Holder:
+                    def __init__(self):
+                        self._b: SafeBox | None = None
+                    def set_b(self):
+                        self._b = SafeBox()
+                    def check(self):
+                        return self._b is None
+            """,
+            "pkg/evil.py": """\
+                import pkg.m
+                class EvilSub(pkg.m.SafeBox):
+                    def __eq__(self, other):
+                        return True
+            """,
+        },
+        "pkg/m.py",
+        "return self._b is None",
+        "return self._b == None",
+    )
+
+    # 7. Qualified monkeypatch `mod.SafeBox.__eq__ = ...` MUST reject
+    assert not run_case(
+        "qualified_eq_patch",
+        {
+            "pkg/m.py": """\
+                class SafeBox:
+                    pass
+                class Holder:
+                    def __init__(self):
+                        self._b: SafeBox | None = None
+                    def set_b(self):
+                        self._b = SafeBox()
+                    def check(self):
+                        return self._b is None
+            """,
+            "pkg/patcher.py": """\
+                import pkg.m as mod
+                mod.SafeBox.__eq__ = lambda self, o: True
+            """,
+        },
+        "pkg/m.py",
+        "return self._b is None",
+        "return self._b == None",
+    )
+
+    # 8. 2-arg functional Enum creation `K("Dyn", ["A"])` MUST reject
+    assert not run_case(
+        "two_arg_enum_ctor",
+        {
+            "pkg/m.py": """\
+                from enum import Enum
+                class K(str, Enum):
+                    A = "a"
+                class W:
+                    def __init__(self):
+                        self.kind = K("Dyn", ["A"])
+                    def check(self):
+                        return self.kind is K.A
+            """
+        },
+        "pkg/m.py",
+        "return self.kind is K.A",
+        "return self.kind == K.A",
+    )
+
+
+def test_class_cleanup_failure_eager_map_and_lazy_heavy_submodules(tmp_path: Path) -> None:
+    import subprocess
+
+    # 1. doClassCleanups() exception stored in tearDown_exceptions MUST fail the test class
+    repo = tmp_path / "cleanup_repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "tests" / "test_cleanup.py").write_text(
+        textwrap.dedent(
+            """\
+            import unittest
+
+            class TestCleanup(unittest.TestCase):
+                @classmethod
+                def setUpClass(cls):
+                    def boom():
+                        raise RuntimeError("cleanup boom")
+                    cls.addClassCleanup(boom)
+
+                def test_ok(self):
+                    self.assertEqual(1, 1)
+            """
+        ),
+        encoding="utf-8",
+    )
+    an_cl = analyze_patch("c_cl", "", repo)
+    out_cl = verify_batch(
+        analyses={"c_cl": an_cl},
+        candidate_sets={"c_cl": frozenset({0})},
+        sqlglot_root=repo,
+        ms_by_num={0: 20},
+        id_by_num={0: "tests/test_cleanup.py::TestCleanup::test_ok"},
+        file_by_num={0: "tests/test_cleanup.py"},
+        file_to_tests={"tests/test_cleanup.py": frozenset({0})},
+        force_verify_all=True,
+    )
+    assert out_cl["c_cl"].final_tests == frozenset({0})
+
+    # 2. _InlinePickleExecutor.map eagerly checks pickling even if consumer breaks early
+    with _InlinePickleExecutor() as pool:
+        with pytest.raises(Exception):
+            pool.map(abs, [1, lambda x: x])
+
+    # 3. _install_lazy_heavy_deps supports submodule imports and pandas.testing attributes
+    probe_code = (
+        f"import sys; sys.path.insert(0, {str(SRC_DIR)!r}); "
+        "import verifier; verifier._install_lazy_heavy_deps(); "
+        "import numpy.typing; "
+        "from pandas.errors import EmptyDataError; "
+        "from pandas.testing import assert_series_equal; "
+        "assert hasattr(numpy.typing, 'NDArray') and EmptyDataError and callable(assert_series_equal)"
+    )
+    res = subprocess.run([sys.executable, "-c", probe_code], capture_output=True, text=True)
+    assert res.returncode == 0, f"lazy heavy submodule probe failed: {res.stderr}"

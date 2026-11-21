@@ -128,18 +128,30 @@ _PRELOADED_TEST_DIALECT_FILES: frozenset[str] = frozenset(
     }
 )
 
-_TPCDS_EXEC_ONLY_FILES: frozenset[str] = frozenset(
+_TPCDS_ALWAYS_BLOCKED_FILES: frozenset[str] = frozenset(
     {
-        "sqlglot/executor/__init__.py",
-        "sqlglot/executor/context.py",
-        "sqlglot/executor/env.py",
-        "sqlglot/executor/python.py",
-        "sqlglot/executor/table.py",
         "sqlglot/planner.py",
+        "sqlglot/generators/python.py",
         "tests/helpers.py",
         "tests/test_executor.py",
     }
 )
+
+_TEST_INFRA_FILES: frozenset[str] = frozenset(
+    {
+        "tests/__init__.py",
+        "tests/test_executor.py",
+        "tests/test_optimizer.py",
+        "tests/helpers.py",
+    }
+)
+
+
+def _is_fixture_path(rel_path: str) -> bool:
+    return rel_path.startswith("tests/fixtures/") or (
+        rel_path.startswith("tests/")
+        and rel_path.endswith((".sql", ".csv", ".csv.gz", ".json"))
+    )
 
 _TPC_EXECUTOR_METHODS: frozenset[str] = frozenset(
     {
@@ -186,7 +198,12 @@ def can_use_preloaded_sqlglot(
     if analysis is None:
         return False
     for fa in analysis.files:
-        if fa.is_ast_noop and not fa.docstring_changed:
+        if (
+            fa.is_ast_noop
+            and not fa.docstring_changed
+            and not fa.semantic_equiv_used
+            and not fa.rel_path.startswith("sqlglot/typing/")
+        ):
             continue
         if fa.is_deleted or fa.is_renamed or fa.syntax_broken or fa.is_new:
             return False
@@ -200,7 +217,12 @@ def can_use_preloaded_test_dialect(analysis: CommitAnalysis | None) -> bool:
     if analysis is None:
         return False
     for fa in analysis.files:
-        if fa.is_ast_noop and not fa.docstring_changed:
+        if (
+            fa.is_ast_noop
+            and not fa.docstring_changed
+            and not fa.semantic_equiv_used
+            and not fa.rel_path.startswith("sqlglot/typing/")
+        ):
             continue
         if fa.is_deleted or fa.is_renamed or fa.syntax_broken or fa.is_new:
             return False
@@ -214,40 +236,56 @@ def can_use_preloaded_test_dialect(analysis: CommitAnalysis | None) -> bool:
     return True
 
 
-def can_skip_pickle_roundtrip(analysis: CommitAnalysis | None) -> bool:
-    """Return True when a commit cannot affect serde or pickle serialization paths."""
-    if analysis is None:
-        return False
-    for fa in analysis.files:
-        if fa.is_ast_noop and not fa.docstring_changed:
-            continue
-        if fa.is_deleted or fa.is_renamed or fa.syntax_broken or fa.is_new:
-            return False
-        if fa.rel_path == "sqlglot/serde.py" or fa.rel_path.startswith("sqlglot/expressions/"):
-            return False
-        for qn in fa.changed_qualnames:
-            leaf = qn.rsplit(".", 1)[-1]
-            if leaf in ("__reduce__", "__reduce_ex__", "__getstate__", "__setstate__", "dump", "load"):
-                return False
-    return True
-
-
 def can_fast_verify_tpcds(
     analysis: CommitAnalysis | None,
     tpcds_plan_hashes: tuple[str, ...] = (),
+    tpcds_exec_lines: Mapping[str, frozenset[int]] | None = None,
+    tpcds_exec_qualnames: Mapping[str, frozenset[str]] | None = None,
+    import_time_qualnames: Mapping[str, frozenset[str]] | None = None,
 ) -> bool:
-    """Return True when #1106 test_execute_tpcds can be verified via precomputed plan hashes."""
-    if not tpcds_plan_hashes or analysis is None:
+    """Return True iff #1106 test_execute_tpcds touches no execute()-phase code or test infra."""
+    if not tpcds_plan_hashes or analysis is None or not tpcds_exec_lines:
         return False
     for fa in analysis.files:
+        touched_paths = {p for p in (fa.rel_path, fa.old_path, fa.new_path) if p}
+        for p in touched_paths:
+            if (
+                p.startswith("sqlglot/executor/")
+                or p in _TPCDS_ALWAYS_BLOCKED_FILES
+                or _is_fixture_path(p)
+            ):
+                return False
         if fa.is_ast_noop and not fa.docstring_changed:
             continue
         if fa.is_deleted or fa.is_renamed or fa.syntax_broken or fa.is_new:
             return False
-        if fa.rel_path in _TPCDS_EXEC_ONLY_FILES or fa.old_path in _TPCDS_EXEC_ONLY_FILES:
-            return False
-        if fa.rel_path.startswith("tests/fixtures/optimizer/tpc-ds/"):
-            return False
+        for p in touched_paths:
+            if import_time_qualnames:
+                imp_qns = import_time_qualnames.get(p, frozenset())
+                if fa.changed_qualnames & imp_qns:
+                    return False
+            if (
+                p.startswith("sqlglot/expressions/")
+                or p in ("sqlglot/errors.py", "sqlglot/optimizer/scope.py")
+            ) and (fa.added_methods or fa.class_header_changed):
+                return False
+            exec_lines = tpcds_exec_lines.get(p)
+            if exec_lines is None:
+                continue
+            if (
+                fa.imports_changed
+                or fa.top_level_code_changed
+                or fa.class_header_changed
+                or fa.attr_changes
+                or fa.added_methods
+            ):
+                return False
+            if (fa.changed_old_lines | fa.expanded_old_lines) & exec_lines:
+                return False
+            if tpcds_exec_qualnames:
+                exec_qns = tpcds_exec_qualnames.get(p, frozenset())
+                if fa.changed_qualnames & exec_qns:
+                    return False
     return True
 
 
@@ -282,9 +320,7 @@ class _FailFastResult(unittest.TestResult):
 
 
 class _InlinePickleExecutor:
-    """In-process ProcessPoolExecutor replacement preserving pickle roundtrip semantics."""
-
-    skip_pickle: bool = False
+    """In-process ProcessPoolExecutor replacement preserving full pickle roundtrip semantics."""
 
     def __init__(
         self,
@@ -294,23 +330,30 @@ class _InlinePickleExecutor:
         initargs: tuple[Any, ...] = (),
     ) -> None:
         if initializer is not None:
-            initializer(*initargs)
+            p_init, p_args = pickle.loads(pickle.dumps((initializer, initargs)))
+            p_init(*p_args)
 
     def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> concurrent.futures.Future[Any]:
         fut: concurrent.futures.Future[Any] = concurrent.futures.Future()
         try:
-            if self.skip_pickle:
-                fut.set_result(fn(*args, **kwargs))
-            else:
-                p_fn, p_args, p_kwargs = pickle.loads(pickle.dumps((fn, args, kwargs)))
-                res = p_fn(*p_args, **p_kwargs)
-                fut.set_result(pickle.loads(pickle.dumps(res)))
+            p_fn, p_args, p_kwargs = pickle.loads(pickle.dumps((fn, args, kwargs)))
+            res = p_fn(*p_args, **p_kwargs)
+            fut.set_result(pickle.loads(pickle.dumps(res)))
         except BaseException as exc:
             fut.set_exception(exc)
         return fut
 
-    def map(self, fn: Any, *iterables: Any, timeout: float | None = None, chunksize: int = 1) -> list[Any]:
-        return [fn(*args) for args in zip(*iterables)]
+    def map(self, fn: Any, *iterables: Any, timeout: float | None = None, chunksize: int = 1) -> Any:
+        items = list(zip(*iterables))
+        for args in items:
+            pickle.loads(pickle.dumps((fn, args)))
+        fs = [self.submit(fn, *args) for args in items]
+
+        def _gen() -> Any:
+            for fut in fs:
+                yield fut.result()
+
+        return _gen()
 
     def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
         return None
@@ -399,13 +442,22 @@ def plan_commit_verification(
     fixture_to_tests: Mapping[str, frozenset[int]] | None = None,
     id_by_num: Mapping[int, str] | None = None,
     tpcds_plan_hashes: tuple[str, ...] = (),
+    tpcds_exec_lines: Mapping[str, frozenset[int]] | None = None,
+    tpcds_exec_qualnames: Mapping[str, frozenset[str]] | None = None,
+    import_time_qualnames: Mapping[str, frozenset[str]] | None = None,
 ) -> VerifyPlan:
     """Decide whether verifying eligible candidates has positive expected ROI."""
     if not candidates:
         return VerifyPlan(frozenset(), frozenset(), 0, 0, False)
 
     use_preloaded = can_use_preloaded_sqlglot(analysis, sqlglot_root)
-    fast_tpcds_ok = can_fast_verify_tpcds(analysis, tpcds_plan_hashes)
+    fast_tpcds_ok = can_fast_verify_tpcds(
+        analysis,
+        tpcds_plan_hashes=tpcds_plan_hashes,
+        tpcds_exec_lines=tpcds_exec_lines,
+        tpcds_exec_qualnames=tpcds_exec_qualnames,
+        import_time_qualnames=import_time_qualnames,
+    )
 
     direct_fixture_tests: set[int] = set()
     if analysis is not None and fixture_to_tests is not None:
@@ -560,6 +612,7 @@ def redirect_preloaded_modules_to_overlay(sqlglot_root_str: str, overlay_dir: st
         fixdir = getattr(helpers_mod, "FIXTURES_DIR", None)
         if isinstance(fixdir, str) and fixdir.startswith(root_prefix):
             helpers_mod.FIXTURES_DIR = ov_prefix + fixdir[len(root_prefix) :]  # type: ignore[attr-defined]
+        helpers_mod.SKIP_INTEGRATION = False  # type: ignore[attr-defined]
 
     sys.path_importer_cache.clear()
     importlib.invalidate_caches()
@@ -597,7 +650,8 @@ def _compile_plan_signature(pe: Any, plan: Any, exp_mod: Any) -> tuple[Any, ...]
         src_alias = src.alias_or_name if isinstance(src, exp_mod.Expr) else str(src)
         extra: list[Any] = []
         if ntype == "Join":
-            for jname, jinfo in sorted(node.joins.items()):
+            extra.append(getattr(node, "source_name", None))
+            for jname, jinfo in node.joins.items():
                 extra.append(
                     (
                         jname,
@@ -629,7 +683,7 @@ def _compile_plan_signature(pe: Any, plan: Any, exp_mod: Any) -> tuple[Any, ...]
                     node.distinct,
                 )
             )
-        deps = tuple(sorted(visit_step(d) for d in node.dependencies))
+        deps = tuple(sorted((visit_step(d) for d in node.dependencies), key=repr))
         res = (
             ntype,
             node.name,
@@ -647,10 +701,17 @@ def _compile_plan_signature(pe: Any, plan: Any, exp_mod: Any) -> tuple[Any, ...]
         return res
 
     root_sig = visit_step(plan.root)
-    sub_sigs = []
-    for sq_name in sorted(list(pe._subquery_plans.keys())):
-        sq_plan, _ = pe._subquery_plans[sq_name]
-        sub_sigs.append((sq_name, visit_step(sq_plan.root)))
+    sub_sigs: list[tuple[str, tuple[Any, ...]]] = []
+    visited_sq: set[str] = set()
+    while True:
+        pending = sorted(k for k in pe._subquery_plans if k not in visited_sq)
+        if not pending:
+            break
+        for sq_name in pending:
+            visited_sq.add(sq_name)
+            sq_plan, _ = pe._subquery_plans[sq_name]
+            sub_sigs.append((sq_name, visit_step(sq_plan.root)))
+    sub_sigs.sort(key=lambda item: item[0])
     return (root_sig, tuple(sub_sigs))
 
 
@@ -685,12 +746,14 @@ def _fast_verify_tpcds(tpcds_plan_hashes: tuple[str, ...], soft_deadline_s: floa
         opt_expr = optimize(p_expr, schema_, leave_tables_isolated=True, dialect=None)
         plan = Plan(opt_expr)
         pe = PythonExecutor()
+        pe._ctes = plan.ctes
         plan_sig = _compile_plan_signature(pe, plan, exp)
+        opt_sql_pretty = opt_expr.sql(pretty=True)
         duck_sql = transpile(sql, write="duckdb")[0]
-        payload = repr((sql, tables, opt_expr.sql(), plan_sig, duck_sql)).encode("utf-8")
+        payload = repr((sql, tables, opt_sql_pretty, plan_sig, duck_sql)).encode("utf-8")
         actual_hash = hashlib.sha256(payload).hexdigest()[:32]
         if actual_hash != expected_hash:
-            diff_queries.append((i, sql, p_expr, tables))
+            diff_queries.append((i, sql, meta, tables))
             if len(diff_queries) > 2:
                 return False
 
@@ -735,11 +798,14 @@ def _fast_verify_tpcds(tpcds_plan_hashes: tuple[str, ...], soft_deadline_s: floa
                 )
             loaded_tables[table_name] = Table(columns=columns, rows=rows)
 
-        for _i, sql, p_expr, tbls in diff_queries:
+        p_schema, p_loaded_tables = pickle.loads(pickle.dumps((TPCDS_SCHEMA, loaded_tables)))
+        for _i, sql, meta, tbls in diff_queries:
             if time.monotonic() >= soft_deadline_s:
                 return False
-            q_tables = {t: loaded_tables[t] for t in tbls}
-            res_table = execute(p_expr, schema=TPCDS_SCHEMA, tables=q_tables)
+            fresh_expr, _ = pickle.loads(pickle.dumps((parse_one(sql), meta)))
+            q_tables = {t: p_loaded_tables[t] for t in tbls}
+            res_table = execute(fresh_expr, schema=p_schema, tables=q_tables)
+            res_table = pickle.loads(pickle.dumps(res_table))
             a = conn.execute(transpile(sql, write="duckdb")[0]).fetchdf()
             b = _pd.DataFrame(
                 ((_np.nan if c is None else c for c in r) for r in res_table.rows),
@@ -784,44 +850,65 @@ class _LazyOptimizerConn:
         return getattr(self._conn, name)
 
 
+_LAZY_HEAVY_DEPS_INSTALLED = False
+
+
 def _install_lazy_heavy_deps() -> None:
     """Defer importing duckdb, numpy, and pandas until a test actually uses them."""
+    global _LAZY_HEAVY_DEPS_INSTALLED
+    if _LAZY_HEAVY_DEPS_INSTALLED:
+        return
+    _LAZY_HEAVY_DEPS_INSTALLED = True
     stubs: dict[str, types.ModuleType] = {}
+    active: set[str] = set()
 
-    def _clear_stubs() -> None:
-        for k, stub in list(stubs.items()):
-            if sys.modules.get(k) is stub:
-                sys.modules.pop(k, None)
+    def _pop_stub(name: str) -> None:
+        stub = stubs.get(name)
+        if stub is not None and sys.modules.get(name) is stub:
+            sys.modules.pop(name, None)
+
+    def _update_stub_in_place(stub: types.ModuleType | None, real_mod: Any) -> None:
+        if stub is None:
+            return
+        real_path = getattr(real_mod, "__path__", None)
+        stub_path = stub.__dict__.get("__path__")
+        if isinstance(stub_path, list) and real_path is not None:
+            stub_path[:] = list(real_path)
+        stub.__dict__.pop("__getattr__", None)
+        for k, v in real_mod.__dict__.items():
+            if k == "__path__" and isinstance(stub_path, list):
+                continue
+            stub.__dict__[k] = v
 
     def _activate_numpy() -> Any:
-        _clear_stubs()
+        if "numpy" not in active:
+            return sys.modules.get("numpy") or importlib.import_module("numpy")
+        active.discard("numpy")
+        _pop_stub("numpy")
         real_np = importlib.import_module("numpy")
-        np_stub = stubs.get("numpy")
-        if np_stub is not None:
-            np_stub.__dict__.pop("__getattr__", None)
-            np_stub.__dict__.update(real_np.__dict__)
+        _update_stub_in_place(stubs.get("numpy"), real_np)
         return real_np
 
     def _activate_pandas() -> Any:
+        if "pandas" not in active:
+            return sys.modules.get("pandas") or importlib.import_module("pandas")
+        active.discard("pandas")
         _activate_numpy()
+        _pop_stub("pandas.testing")
+        _pop_stub("pandas")
         real_pd = importlib.import_module("pandas")
         real_testing = importlib.import_module("pandas.testing")
-        pd_stub = stubs.get("pandas")
-        if pd_stub is not None:
-            pd_stub.__dict__.pop("__getattr__", None)
-            pd_stub.__dict__.update(real_pd.__dict__)
-        t_stub = stubs.get("pandas.testing")
-        if t_stub is not None:
-            t_stub.__dict__.update(real_testing.__dict__)
+        _update_stub_in_place(stubs.get("pandas"), real_pd)
+        _update_stub_in_place(stubs.get("pandas.testing"), real_testing)
         return real_pd
 
     def _activate_duckdb() -> Any:
-        _clear_stubs()
+        if "duckdb" not in active:
+            return sys.modules.get("duckdb") or importlib.import_module("duckdb")
+        active.discard("duckdb")
+        _pop_stub("duckdb")
         real_duck = importlib.import_module("duckdb")
-        d_stub = stubs.get("duckdb")
-        if d_stub is not None:
-            d_stub.__dict__.pop("__getattr__", None)
-            d_stub.__dict__.update(real_duck.__dict__)
+        _update_stub_in_place(stubs.get("duckdb"), real_duck)
         return real_duck
 
     if "numpy" not in sys.modules:
@@ -829,6 +916,7 @@ def _install_lazy_heavy_deps() -> None:
         np_pkg.__path__ = []  # type: ignore[attr-defined]
         np_pkg.__getattr__ = lambda name: getattr(_activate_numpy(), name)  # type: ignore[attr-defined]
         stubs["numpy"] = np_pkg
+        active.add("numpy")
         sys.modules["numpy"] = np_pkg
 
     if "pandas" not in sys.modules and "pandas.testing" not in sys.modules:
@@ -843,9 +931,13 @@ def _install_lazy_heavy_deps() -> None:
         pd_pkg.__getattr__ = lambda name: getattr(_activate_pandas(), name)  # type: ignore[attr-defined]
         testing_mod = types.ModuleType("pandas.testing")
         testing_mod.assert_frame_equal = lazy_assert_frame_equal  # type: ignore[attr-defined]
+        testing_mod.__getattr__ = lambda name: getattr(  # type: ignore[attr-defined]
+            (_activate_pandas(), importlib.import_module("pandas.testing"))[1], name
+        )
         pd_pkg.testing = testing_mod  # type: ignore[attr-defined]
         stubs["pandas"] = pd_pkg
         stubs["pandas.testing"] = testing_mod
+        active.add("pandas")
         sys.modules["pandas"] = pd_pkg
         sys.modules["pandas.testing"] = testing_mod
 
@@ -854,7 +946,26 @@ def _install_lazy_heavy_deps() -> None:
         duck_pkg.__path__ = []  # type: ignore[attr-defined]
         duck_pkg.__getattr__ = lambda name: getattr(_activate_duckdb(), name)  # type: ignore[attr-defined]
         stubs["duckdb"] = duck_pkg
+        active.add("duckdb")
         sys.modules["duckdb"] = duck_pkg
+
+    if active:
+        activators = {
+            "numpy": _activate_numpy,
+            "pandas": _activate_pandas,
+            "duckdb": _activate_duckdb,
+        }
+
+        class _LazyHeavySubmoduleFinder:
+            def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
+                top = fullname.split(".", 1)[0]
+                if top in active:
+                    activators[top]()
+                if not active and self in sys.meta_path:
+                    sys.meta_path.remove(self)
+                return None
+
+        sys.meta_path.insert(0, _LazyHeavySubmoduleFinder())  # type: ignore[arg-type]
 
 
 def _run_pytest_fallback(test_id: str) -> bool:
@@ -871,7 +982,6 @@ def _child_execute(
     soft_deadline_s: float,
     *,
     patched_files: frozenset[str] = frozenset(),
-    skip_pickle: bool = False,
     fast_tpcds: bool = False,
     tpcds_plan_hashes: tuple[str, ...] = (),
 ) -> dict[str, Any]:
@@ -887,7 +997,6 @@ def _child_execute(
     redirect_preloaded_modules_to_overlay(sqlglot_root_str, overlay_dir)
     os.environ["PYTHONPATH"] = overlay_dir
     os.environ["SKIP_INTEGRATION"] = "0"
-    _InlinePickleExecutor.skip_pickle = skip_pickle
     concurrent.futures.ProcessPoolExecutor = _InlinePickleExecutor  # type: ignore[misc]
 
     passed: list[int] = []
@@ -938,10 +1047,13 @@ def _child_execute(
             (test_num, meth_name, test_id)
         )
 
-    can_filter_executor_setup = (
-        "tests/test_executor.py" not in patched_files and "tests/helpers.py" not in patched_files
+    test_infra_modified = any(
+        p in _TEST_INFRA_FILES or _is_fixture_path(p) for p in patched_files
     )
-    can_lazy_optimizer_setup = "tests/test_optimizer.py" not in patched_files
+    can_filter_executor_setup = (
+        not test_infra_modified and "sqlglot/executor/table.py" not in patched_files
+    )
+    can_lazy_optimizer_setup = not test_infra_modified
 
     for tfile in sorted(by_file_cls):
         if time.monotonic() >= soft_deadline_s:
@@ -996,6 +1108,8 @@ def _child_execute(
                         orig_tpch_schema = mod.TPCH_SCHEMA
                         mod.TPCH_SCHEMA = {}
 
+            if hasattr(cls, "tearDown_exceptions"):
+                cls.tearDown_exceptions = []
             try:
                 if (
                     can_lazy_optimizer_setup
@@ -1035,6 +1149,8 @@ def _child_execute(
                     mod.TPCH_SCHEMA = orig_tpch_schema
                 continue
 
+            cls_passed: list[int] = []
+            teardown_failed = False
             try:
                 for test_num, meth_name, _test_id in methods:
                     if time.monotonic() >= soft_deadline_s:
@@ -1048,7 +1164,7 @@ def _child_execute(
                     except BaseException:
                         res.failed = True
                     if not res.failed:
-                        passed.append(test_num)
+                        cls_passed.append(test_num)
             finally:
                 if orig_tpcds_schema is not None:
                     mod.TPCDS_SCHEMA = orig_tpcds_schema
@@ -1059,12 +1175,16 @@ def _child_execute(
                         if hasattr(cls, "tearDownClass"):
                             cls.tearDownClass()
                     except BaseException:
-                        pass
+                        teardown_failed = True
                     try:
                         if hasattr(cls, "doClassCleanups"):
                             cls.doClassCleanups()
                     except BaseException:
-                        pass
+                        teardown_failed = True
+                    if getattr(cls, "tearDown_exceptions", None):
+                        teardown_failed = True
+            if not teardown_failed:
+                passed.extend(cls_passed)
 
     ru_self = resource.getrusage(resource.RUSAGE_SELF)
     ru_kids = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -1137,8 +1257,15 @@ def _run_fork_queue(
             timeout_s = min(per_commit_timeout_s, remaining_batch - 0.5)
             overlay_dir = create_overlay(sqlglot_root, analysis.patched_contents, tmp_base=tmp_base)
             test_specs = [(n, id_by_num[n]) for n in sorted(plan.to_verify)]
-            patched_files = frozenset(analysis.patched_contents.keys())
-            skip_pickle = can_skip_pickle_roundtrip(analysis)
+            patched_files = frozenset(
+                set(analysis.patched_contents.keys())
+                | {
+                    p
+                    for fa in analysis.files
+                    for p in (fa.rel_path, fa.old_path, fa.new_path)
+                    if p
+                }
+            )
 
             r_fd, w_fd = os.pipe()
             pid = os.fork()
@@ -1152,7 +1279,6 @@ def _run_fork_queue(
                         test_specs,
                         soft_deadline,
                         patched_files=patched_files,
-                        skip_pickle=skip_pickle,
                         fast_tpcds=plan.fast_tpcds,
                         tpcds_plan_hashes=tpcds_plan_hashes,
                     )
@@ -1306,6 +1432,9 @@ def verify_batch(
     *,
     fixture_to_tests: Mapping[str, frozenset[int]] | None = None,
     tpcds_plan_hashes: tuple[str, ...] = (),
+    tpcds_exec_lines: Mapping[str, frozenset[int]] | None = None,
+    tpcds_exec_qualnames: Mapping[str, frozenset[str]] | None = None,
+    import_time_qualnames: Mapping[str, frozenset[str]] | None = None,
     per_commit_timeout_s: float = PER_COMMIT_WALL_TIMEOUT_S,
     global_wall_budget_s: float = GLOBAL_WALL_BUDGET_S,
     max_concurrent: int = MAX_CONCURRENT_CHILDREN,
@@ -1332,6 +1461,9 @@ def verify_batch(
             fixture_to_tests=fixture_to_tests,
             id_by_num=id_by_num,
             tpcds_plan_hashes=tpcds_plan_hashes,
+            tpcds_exec_lines=tpcds_exec_lines,
+            tpcds_exec_qualnames=tpcds_exec_qualnames,
+            import_time_qualnames=import_time_qualnames,
         )
         if force_verify_all and cands:
             plan = VerifyPlan(
@@ -1396,6 +1528,7 @@ def verify_batch(
                 root_str = str(sqlglot_root)
                 if root_str not in sys.path:
                     sys.path.insert(0, root_str)
+                os.environ["SKIP_INTEGRATION"] = "0"
                 importlib.import_module("sqlglot")
 
                 tier2a = []
