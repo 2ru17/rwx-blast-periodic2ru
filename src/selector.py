@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import marshal
+import os
+from array import array
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +36,7 @@ _CORE_BASE_FILES = (
     "sqlglot/tokenizer_core.py",
 )
 _LIFECYCLE_METHODS = frozenset({"setUp", "tearDown", "setUpClass", "tearDownClass"})
+_MAP_FILES = ("test_index.json", "coverage_map.json", "ast_index.json", "import_graph.json")
 
 
 def _decode_set(encoded: list[int | list[int]]) -> frozenset[int]:
@@ -43,6 +47,49 @@ def _decode_set(encoded: list[int | list[int]]) -> frozenset[int]:
         else:
             out.append(item)
     return frozenset(out)
+
+
+def _pack_set(encoded: list[int | list[int]]) -> bytes:
+    """Pack a JSON-encoded test set as native uint32 (start, end) pairs, one pair per item."""
+    pairs = array("I")
+    for item in encoded:
+        if isinstance(item, list):
+            pairs.extend((item[0], item[1]))
+        else:
+            pairs.extend((item, item))
+    return pairs.tobytes()
+
+
+def _unpack_set(packed: bytes) -> frozenset[int]:
+    pairs = array("I")
+    pairs.frombytes(packed)
+    out: list[int] = []
+    for i in range(0, len(pairs), 2):
+        out.extend(range(pairs[i], pairs[i + 1] + 1))
+    return frozenset(out)
+
+
+class CoverageSets:
+    """The coverage map's test sets, each decoded the first time it is indexed.
+
+    A run reads a few hundred of the ~10k sets, so decoding all of them up front costs more than
+    the whole selection.
+    """
+
+    __slots__ = ("_packed", "_decoded")
+
+    def __init__(self, packed: tuple[bytes, ...]) -> None:
+        self._packed = packed
+        self._decoded: list[frozenset[int] | None] = [None] * len(packed)
+
+    def __len__(self) -> int:
+        return len(self._packed)
+
+    def __getitem__(self, sid: int) -> frozenset[int]:
+        found = self._decoded[sid]
+        if found is None:
+            found = self._decoded[sid] = _unpack_set(self._packed[sid])
+        return found
 
 
 def _dialect_family_from_path(rel_path: str) -> str | None:
@@ -66,75 +113,169 @@ class SelectionResult:
     has_syntax_or_import_break: bool
 
 
+def decode_static_maps(maps_dir: Path) -> dict[str, Any]:
+    """Decode the four plain JSON maps into every lookup structure that does not depend on /data."""
+    test_index = json.loads((maps_dir / "test_index.json").read_text(encoding="utf-8"))
+    cov_map = json.loads((maps_dir / "coverage_map.json").read_text(encoding="utf-8"))
+    ast_index = json.loads((maps_dir / "ast_index.json").read_text(encoding="utf-8"))
+    import_graph = json.loads((maps_dir / "import_graph.json").read_text(encoding="utf-8"))
+
+    encoded_sets = cov_map["sets"]
+    file_to_tests = {f: frozenset(nums) for f, nums in test_index["file_to_test_numbers"].items()}
+    source_inspecting_tests = frozenset(test_index.get("source_inspecting_tests", ()))
+    source_file_to_inspecting_tests = {
+        rel: frozenset(nums)
+        for rel, nums in test_index.get("source_file_to_inspecting_tests", {}).items()
+    }
+    mapped_inspecting: set[int] = set()
+    for nums in source_file_to_inspecting_tests.values():
+        mapped_inspecting.update(nums)
+    tpcds_exec_lines = {
+        rel: _decode_set(enc) for rel, enc in test_index.get("tpcds_exec_lines", {}).items()
+    }
+    tpcds_exec_qualnames: dict[str, frozenset[str]] = {}
+    for rel, exec_lines in tpcds_exec_lines.items():
+        f_ast = ast_index.get(rel, {})
+        tpcds_exec_qualnames[rel] = frozenset(
+            qn
+            for qn, kind, start, end in f_ast.get("symbols", ())
+            if kind in ("function", "method") and any(start <= ln <= end for ln in exec_lines)
+        )
+
+    qualname_to_set: dict[str, dict[str, int]] = cov_map["qualname_to_set"]
+    # Base-class method coverage by leaf method name, for subclass override propagation.
+    base_method_sids: dict[str, list[int]] = {}
+    for rel in _CORE_BASE_FILES:
+        for qn, sid in qualname_to_set.get(rel, {}).items():
+            if "." in qn:
+                meth = qn.rsplit(".", 1)[1]
+                base_method_sids.setdefault(meth, []).append(sid)
+    # Class/module attributes across core base files (non-empty sets only), for newly added subclass attributes.
+    base_attr_sids: dict[str, list[int]] = {}
+    for rel in _CORE_BASE_FILES:
+        f_ast = ast_index.get(rel, {})
+        for attrs in f_ast.get("class_attrs", {}).values():
+            for attr_name, info in attrs.items():
+                if _decode_set(encoded_sets[info["set_id"]]):
+                    base_attr_sids.setdefault(attr_name, []).append(info["set_id"])
+
+    return {
+        "sets": tuple(_pack_set(s) for s in encoded_sets),
+        "line_to_set": {
+            rel: {int(k): v for k, v in ln_dict.items()}
+            for rel, ln_dict in cov_map["line_to_set"].items()
+        },
+        "import_time_lines": {
+            rel: frozenset(lns) for rel, lns in cov_map.get("import_time_lines", {}).items()
+        },
+        "import_time_qualnames": {
+            rel: frozenset(qns) for rel, qns in cov_map.get("import_time_qualnames", {}).items()
+        },
+        "qualname_to_set": qualname_to_set,
+        "file_to_set": cov_map["file_to_set"],
+        "ast_index": ast_index,
+        "modules": import_graph["modules"],
+        "dialect_family_sids": dict(import_graph["dialect_families"]),
+        "dialect_import_closure": frozenset(import_graph.get("dialect_import_closure", ())),
+        "file_to_tests": file_to_tests,
+        "fixture_to_tests": {
+            f: frozenset(nums) for f, nums in test_index["fixture_to_test_numbers"].items()
+        },
+        "source_inspecting_tests": source_inspecting_tests,
+        "source_file_to_inspecting_tests": source_file_to_inspecting_tests,
+        "unmapped_source_inspecting_tests": source_inspecting_tests - mapped_inspecting,
+        "tpcds_plan_hashes": tuple(test_index.get("tpcds_plan_hashes", ())),
+        "tpcds_exec_lines": tpcds_exec_lines,
+        "tpcds_exec_qualnames": tpcds_exec_qualnames,
+        "base_method_sids": base_method_sids,
+        "base_attr_sids": base_attr_sids,
+        "tests": test_index["tests"],
+    }
+
+
+def _maps_stamp(maps_dir: Path) -> tuple[str, tuple[tuple[str, int, int], ...]]:
+    # Whole seconds: image layers keep mtimes only to the second, so nanoseconds differ after export.
+    stats = []
+    for name in _MAP_FILES:
+        st = os.stat(maps_dir / name)
+        stats.append((name, st.st_size, int(st.st_mtime)))
+    return str(maps_dir.resolve()), tuple(stats)
+
+
+def write_maps_cache(maps_dir: Path, out_path: Path) -> None:
+    """Build-time only: marshal decode_static_maps() with a stamp of the JSON files it was decoded from."""
+    out_path.write_bytes(marshal.dumps({"stamp": _maps_stamp(maps_dir), "maps": decode_static_maps(maps_dir)}))
+
+
+def load_static_maps(maps_dir: Path, cache_path: Path | None = None) -> dict[str, Any]:
+    """Return the build-time cache when it was made from these exact JSON files, else decode the JSON."""
+    if cache_path is not None:
+        try:
+            payload = marshal.loads(cache_path.read_bytes())
+            if payload["stamp"] == _maps_stamp(maps_dir):
+                return payload["maps"]
+        except (OSError, EOFError, ValueError, TypeError, KeyError):
+            pass
+    return decode_static_maps(maps_dir)
+
+
 class BlastSelector:
     """Selects candidate failing tests for each commit using precomputed sqlglot@eb11aec maps."""
 
-    def __init__(self, maps_dir: Path, runtime_tests: list[dict[str, Any]] | None = None) -> None:
-        test_index = json.loads((maps_dir / "test_index.json").read_text(encoding="utf-8"))
-        cov_map = json.loads((maps_dir / "coverage_map.json").read_text(encoding="utf-8"))
-        ast_index = json.loads((maps_dir / "ast_index.json").read_text(encoding="utf-8"))
-        import_graph = json.loads((maps_dir / "import_graph.json").read_text(encoding="utf-8"))
-
-        self.sets: tuple[frozenset[int], ...] = tuple(_decode_set(s) for s in cov_map["sets"])
-        self.line_to_set: dict[str, dict[int, int]] = {
-            rel: {int(k): v for k, v in ln_dict.items()}
-            for rel, ln_dict in cov_map["line_to_set"].items()
-        }
-        self.import_time_lines: dict[str, frozenset[int]] = {
-            rel: frozenset(lns) for rel, lns in cov_map.get("import_time_lines", {}).items()
-        }
-        self.import_time_qualnames: dict[str, frozenset[str]] = {
-            rel: frozenset(qns) for rel, qns in cov_map.get("import_time_qualnames", {}).items()
-        }
-        self.qualname_to_set: dict[str, dict[str, int]] = cov_map["qualname_to_set"]
-        self.file_to_set: dict[str, int] = cov_map["file_to_set"]
-        self.ast_index: dict[str, Any] = ast_index
-        self.modules: dict[str, Any] = import_graph["modules"]
+    def __init__(
+        self,
+        maps_dir: Path,
+        runtime_tests: list[dict[str, Any]] | None = None,
+        cache_path: Path | None = None,
+    ) -> None:
+        m = load_static_maps(maps_dir, cache_path)
+        self.sets = CoverageSets(m["sets"])
+        self.line_to_set: dict[str, dict[int, int]] = m["line_to_set"]
+        self.import_time_lines: dict[str, frozenset[int]] = m["import_time_lines"]
+        self.import_time_qualnames: dict[str, frozenset[str]] = m["import_time_qualnames"]
+        self.qualname_to_set: dict[str, dict[str, int]] = m["qualname_to_set"]
+        self.file_to_set: dict[str, int] = m["file_to_set"]
+        self.ast_index: dict[str, Any] = m["ast_index"]
+        self.modules: dict[str, Any] = m["modules"]
         self.dialect_families: dict[str, frozenset[int]] = {
-            fam: self.sets[sid] for fam, sid in import_graph["dialect_families"].items()
+            fam: self.sets[sid] for fam, sid in m["dialect_family_sids"].items()
         }
-
-        self.file_to_tests: dict[str, frozenset[int]] = {
-            f: frozenset(nums) for f, nums in test_index["file_to_test_numbers"].items()
-        }
-        self.fixture_to_tests: dict[str, frozenset[int]] = {
-            f: frozenset(nums) for f, nums in test_index["fixture_to_test_numbers"].items()
-        }
-        self.source_inspecting_tests: frozenset[int] = frozenset(
-            test_index.get("source_inspecting_tests", ())
-        )
-        self.source_file_to_inspecting_tests: dict[str, frozenset[int]] = {
-            rel: frozenset(nums)
-            for rel, nums in test_index.get("source_file_to_inspecting_tests", {}).items()
-        }
-        mapped_inspecting: set[int] = set()
-        for nums in self.source_file_to_inspecting_tests.values():
-            mapped_inspecting.update(nums)
-        self.unmapped_source_inspecting_tests: frozenset[int] = (
-            self.source_inspecting_tests - mapped_inspecting
-        )
-        self.tpcds_plan_hashes: tuple[str, ...] = tuple(
-            test_index.get("tpcds_plan_hashes", ())
-        )
-        self.tpcds_exec_lines: dict[str, frozenset[int]] = {
-            rel: _decode_set(enc)
-            for rel, enc in test_index.get("tpcds_exec_lines", {}).items()
-        }
-        self.tpcds_exec_qualnames: dict[str, frozenset[str]] = {}
-        for rel, exec_lines in self.tpcds_exec_lines.items():
-            f_ast = self.ast_index.get(rel, {})
-            self.tpcds_exec_qualnames[rel] = frozenset(
-                qn
-                for qn, kind, start, end in f_ast.get("symbols", ())
-                if kind in ("function", "method") and any(start <= ln <= end for ln in exec_lines)
-            )
+        raw_closure = m.get("dialect_import_closure")
+        if raw_closure:
+            self.dialect_import_closure: frozenset[str] = frozenset(raw_closure)
+        else:
+            closure_set: set[str] = {
+                "sqlglot/dialects/__init__.py",
+                "sqlglot/dialects/athena.py",
+                "sqlglot/dialects/snowflake.py",
+            }
+            queue = list(closure_set)
+            while queue:
+                cur = queue.pop()
+                for dep in self.modules.get(cur, {}).get("imports", ()):
+                    if dep not in closure_set:
+                        closure_set.add(dep)
+                        queue.append(dep)
+            self.dialect_import_closure = frozenset(closure_set)
+        self.file_to_tests: dict[str, frozenset[int]] = m["file_to_tests"]
+        self.fixture_to_tests: dict[str, frozenset[int]] = m["fixture_to_tests"]
+        self.source_inspecting_tests: frozenset[int] = m["source_inspecting_tests"]
+        self.source_file_to_inspecting_tests: dict[str, frozenset[int]] = m[
+            "source_file_to_inspecting_tests"
+        ]
+        self.unmapped_source_inspecting_tests: frozenset[int] = m["unmapped_source_inspecting_tests"]
+        self.tpcds_plan_hashes: tuple[str, ...] = m["tpcds_plan_hashes"]
+        self.tpcds_exec_lines: dict[str, frozenset[int]] = m["tpcds_exec_lines"]
+        self.tpcds_exec_qualnames: dict[str, frozenset[str]] = m["tpcds_exec_qualnames"]
+        self.base_method_sids: dict[str, list[int]] = m["base_method_sids"]
+        self.base_attr_sids: dict[str, list[int]] = m["base_attr_sids"]
 
         self.id_by_num: dict[int, str] = {}
         self.num_by_id: dict[str, int] = {}
         self.class_to_tests: dict[tuple[str, str], list[int]] = defaultdict(list)
         self.method_to_test: dict[tuple[str, str], int] = {}
 
-        tests_src = runtime_tests if runtime_tests is not None else test_index["tests"]
+        tests_src = runtime_tests if runtime_tests is not None else m["tests"]
         self.all_test_nums: frozenset[int] = frozenset(t["number"] for t in tests_src)
         for t in tests_src:
             num = t["number"]
@@ -154,24 +295,6 @@ class BlastSelector:
         self.dialect_import_tests: frozenset[int] = self.file_to_tests.get(
             "tests/test_dialect_imports.py", frozenset()
         )
-
-        # Index base-class method coverage by leaf method name for subclass override propagation.
-        self.base_method_sets: dict[str, list[frozenset[int]]] = defaultdict(list)
-        for rel in _CORE_BASE_FILES:
-            for qn, sid in self.qualname_to_set.get(rel, {}).items():
-                if "." in qn:
-                    meth = qn.rsplit(".", 1)[1]
-                    self.base_method_sets[meth].append(self.sets[sid])
-
-        # Index class/module attributes across core base files for newly added subclass attributes.
-        self.base_attr_sets: dict[str, list[frozenset[int]]] = defaultdict(list)
-        for rel in _CORE_BASE_FILES:
-            f_ast = self.ast_index.get(rel, {})
-            for attrs in f_ast.get("class_attrs", {}).values():
-                for attr_name, info in attrs.items():
-                    tset = self.sets[info["set_id"]]
-                    if tset:
-                        self.base_attr_sets[attr_name].append(tset)
 
     def _transitive_tests(self, rel_path: str) -> set[int]:
         out: set[int] = set()
@@ -241,10 +364,11 @@ class BlastSelector:
             out.update(self._transitive_tests(p))
             out.update(self._file_runtime_tests(p))
             out.update(self._dialect_family_tests(p))
+            if p.startswith("sqlglot/"):
+                out.update(self.dialect_import_tests)
             if p.startswith("sqlglot/typing/") and self.typing_meta_test is not None:
                 out.add(self.typing_meta_test)
             if p.startswith("sqlglot/dialects/"):
-                out.update(self.dialect_import_tests)
                 out.update(self.file_to_tests.get("tests/dialects/test_dialect.py", ()))
             if p in (
                 "sqlglot/__init__.py",
@@ -261,6 +385,7 @@ class BlastSelector:
         if rel.startswith("sqlglot/typing/"):
             if self.typing_meta_test is not None:
                 out.add(self.typing_meta_test)
+            out.update(self.dialect_import_tests)
             out.update(self.file_to_tests.get("tests/test_typing.py", ()))
             out.update(self._dialect_family_tests(rel))
             return out
@@ -349,6 +474,20 @@ class BlastSelector:
         imp_qns = self.import_time_qualnames.get(rel, frozenset())
         f_ast = self.ast_index.get(rel, {})
         fam_tests = self._dialect_family_tests(rel)
+        if rel == "sqlglot/dialects/__init__.py" or (
+            rel in self.dialect_import_closure
+            and (
+                fa.imports_changed
+                or fa.top_level_code_changed
+                or fa.class_header_changed
+                or fa.attr_changes
+                or fa.added_methods
+                or any(qn in imp_qns for qn in fa.changed_qualnames)
+                or any(ln in imp_lines for ln in (fa.changed_old_lines | fa.expanded_old_lines))
+            )
+        ):
+            # Lazy dialect imports execute import-time code whose coverage is not attributed to tests.
+            out.update(self.dialect_import_tests)
 
         sym_spans: dict[str, list[tuple[int, int]]] = defaultdict(list)
         for qn, _k, s, e in f_ast.get("symbols", ()):
@@ -368,7 +507,8 @@ class BlastSelector:
 
         for ln in fa.expanded_old_lines:
             if (
-                mapped_attr_spans
+                ln in imp_lines
+                and mapped_attr_spans
                 and any(s <= ln <= e for s, e in mapped_attr_spans)
                 and not any(s <= ln <= e for s, e in changed_func_spans)
             ):
@@ -398,10 +538,16 @@ class BlastSelector:
                 else f_ast.get("module_attrs", {}).get(ac.attr_name)
             )
             if info is not None:
+                is_expression_arg_types = (
+                    rel.startswith("sqlglot/expressions/")
+                    and ac.class_qn is not None
+                    and ac.attr_name == "arg_types"
+                )
                 if (
                     ac.changed_dict_keys
                     and not ac.whole_attr_changed
                     and not ac.keys_membership_changed
+                    and not is_expression_arg_types
                 ):
                     dk_map = info.get("dict_keys", {})
                     for key in ac.changed_dict_keys:
@@ -412,34 +558,41 @@ class BlastSelector:
                             out.update(self.sets[info["set_id"]])
                 else:
                     out.update(self.sets[info["set_id"]])
+                if is_expression_arg_types:
+                    out.update(self.sets[qn_map.get(ac.class_qn, 0)])
             else:
-                base_sets = self.base_attr_sets.get(ac.attr_name)
-                if base_sets and fam_tests:
-                    base_union: set[int] = set()
-                    for s in base_sets:
-                        base_union.update(s)
-                    inter = base_union & fam_tests
-                    out.update(inter if inter else fam_tests)
+                base_sids = self.base_attr_sids.get(ac.attr_name)
+                if base_sids:
+                    for sid in base_sids:
+                        out.update(self.sets[sid])
+                    out.update(fam_tests)
                 elif fam_tests:
                     out.update(fam_tests)
                 else:
                     out.update(self._file_runtime_tests(rel))
 
+            if (
+                ac.class_qn is not None
+                and ac.attr_name in {"KEYWORDS", "TOKENS", "SINGLE_TOKENS"}
+                and (rel == "sqlglot/tokens.py" or rel.startswith("sqlglot/dialects/"))
+            ):
+                # Tokenizer tables can be copied into per-dialect objects before test coverage starts.
+                out.update(self._file_runtime_tests("sqlglot/tokenizer_core.py"))
+                out.update(self._file_runtime_tests("sqlglot/tokens.py"))
+                out.update(self._transitive_tests(rel))
+                out.update(self.dialect_import_tests)
             if rel.startswith("sqlglot/typing/") and self.typing_meta_test is not None:
                 out.add(self.typing_meta_test)
 
-        # Newly added subclass methods propagate to base-class coverage intersected with dialect family.
+        # Newly added subclass methods can affect both base-class and dialect-family callers.
         for _cls_qn, meth in fa.added_methods:
-            base_sets = self.base_method_sets.get(meth)
-            if base_sets:
+            base_sids = self.base_method_sids.get(meth)
+            if base_sids:
                 base_union = set()
-                for s in base_sets:
-                    base_union.update(s)
-                if fam_tests:
-                    inter = base_union & fam_tests
-                    out.update(inter if inter else fam_tests)
-                else:
-                    out.update(base_union)
+                for sid in base_sids:
+                    base_union.update(self.sets[sid])
+                out.update(base_union)
+                out.update(fam_tests)
             elif fam_tests:
                 out.update(fam_tests)
             else:
@@ -488,13 +641,15 @@ class BlastSelector:
                 in_sym_changed = [ln for ln in fa.expanded_old_lines if s_ln <= ln <= e_ln]
                 if not in_sym_changed:
                     continue
-                hit_covered_runtime = any(ln in ln_map and ln not in imp_lines for ln in in_sym_changed)
+                hit_uncovered_or_import = any(
+                    ln not in ln_map or ln in imp_lines for ln in in_sym_changed
+                )
                 hit_header_or_imp = any(
                     ln == s_ln or ln in imp_lines
                     for ln in fa.changed_old_lines
                     if s_ln <= ln <= e_ln
                 )
-                if not hit_covered_runtime or hit_header_or_imp:
+                if hit_uncovered_or_import or hit_header_or_imp:
                     out.update(self.sets[sid])
                     break
 

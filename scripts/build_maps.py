@@ -620,6 +620,19 @@ class _SymbolCollector(ast.NodeVisitor):
                             src_attr = _root_attr_name(kw.value)
                             if src_attr:
                                 self.forwarded_attrs.append((src_attr, kw.arg))
+                elif isinstance(sub, (ast.Assign, ast.AnnAssign)):
+                    targets = sub.targets if isinstance(sub, ast.Assign) else [sub.target]
+                    val = sub.value
+                    if val is None:
+                        continue
+                    dst_attrs = [d for t in targets if (d := _root_attr_name(t))]
+                    if dst_attrs:
+                        for vsub in ast.walk(val):
+                            src_attr = _root_attr_name(vsub)
+                            if src_attr:
+                                for dst_attr in dst_attrs:
+                                    if src_attr != dst_attr:
+                                        self.forwarded_attrs.append((src_attr, dst_attr))
             self.generic_visit(node)
         else:
             self._in_forwarding = False
@@ -699,7 +712,7 @@ class _SymbolCollector(ast.NodeVisitor):
             return
         start = stmt.lineno
         end = stmt.end_lineno or stmt.lineno
-        dict_keys: dict[str, tuple[int, int, str | None, bool]] = {}
+        dict_keys: dict[str, tuple[int, int, str | None, bool, tuple[str, ...]]] = {}
         if isinstance(value, ast.Dict):
             for k_node, v_node in zip(value.keys, value.values):
                 k_str = _expr_str_key(k_node)
@@ -708,8 +721,10 @@ class _SymbolCollector(ast.NodeVisitor):
                     k_end = v_node.end_lineno or v_node.lineno
                     callee = _call_name(v_node)
                     k_callable = _contains_callable(v_node)
-                    dict_keys[k_str] = (k_start, k_end, callee, k_callable)
+                    k_refs = _extract_value_refs(v_node)
+                    dict_keys[k_str] = (k_start, k_end, callee, k_callable, k_refs)
         attr_callable = _contains_callable(value)
+        attr_refs = _extract_value_refs(value)
         for tgt in targets:
             if isinstance(tgt, ast.Name):
                 entry = {
@@ -718,11 +733,22 @@ class _SymbolCollector(ast.NodeVisitor):
                     "dict_keys": dict_keys,
                     "callee": _call_name(value),
                     "has_callable": attr_callable,
+                    "val_refs": attr_refs,
                 }
                 if class_qn is not None:
                     self.class_attrs[class_qn][tgt.id] = entry
                 else:
                     self.module_attrs[tgt.id] = entry
+
+
+def _extract_value_refs(node: ast.AST) -> tuple[str, ...]:
+    refs: set[str] = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name):
+            refs.add(sub.id)
+        elif isinstance(sub, ast.Attribute):
+            refs.add(sub.attr)
+    return tuple(sorted(refs))
 
 
 def _contains_callable(node: ast.AST) -> bool:
@@ -1221,12 +1247,119 @@ def compute_tpcds_execute_coverage(sqlglot_dir: Path) -> dict[str, list[int | li
         os.chdir(prev_cwd)
 
 
+def collect_runtime_instantiations(
+    sqlglot_dir: Path,
+    id_to_num: dict[str, int],
+) -> tuple[dict[str, set[int]], dict[str, set[int]]]:
+    """Trace per-test Expr subclass and Dialect family instantiations without coverage overhead."""
+    import pytest
+
+    os.environ["SKIP_INTEGRATION"] = "0"
+    os.environ["PYTHONPATH"] = str(sqlglot_dir)
+    sqlglot_root_str = str(sqlglot_dir)
+    if sys.path[0] != sqlglot_root_str:
+        sys.path.insert(0, sqlglot_root_str)
+    prev_cwd = os.getcwd()
+    os.chdir(sqlglot_root_str)
+
+    from sqlglot.dialects.dialect import Dialect
+    from sqlglot.expressions.core import Expr
+    from sqlglot.tokens import Tokenizer
+
+    expr_to_tests: dict[str, set[int]] = defaultdict(set)
+    dialect_to_tests: dict[str, set[int]] = defaultdict(set)
+    cur_exprs: set[type] = set()
+    cur_dialects: set[type] = set()
+    active: dict[str, int | None] = {"num": None}
+
+    orig_expr_init = Expr.__init__
+    orig_dialect_init = Dialect.__init__
+    orig_get_or_raise = Dialect.get_or_raise.__func__  # type: ignore[attr-defined]
+    orig_tok_init = Tokenizer.__init__
+
+    def _traced_expr_init(self: Any, **args: object) -> None:
+        if active["num"] is not None:
+            cur_exprs.add(type(self))
+        orig_expr_init(self, **args)
+
+    def _traced_dialect_init(self: Any, **kwargs: Any) -> None:
+        if active["num"] is not None:
+            cur_dialects.add(type(self))
+        orig_dialect_init(self, **kwargs)
+
+    @classmethod  # type: ignore[misc]
+    def _traced_get_or_raise(cls: Any, dialect: Any) -> Any:
+        res = orig_get_or_raise(cls, dialect)
+        if active["num"] is not None and res is not None:
+            cur_dialects.add(type(res))
+        return res
+
+    def _traced_tok_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        if active["num"] is not None:
+            cur_dialects.add(type(self))
+        orig_tok_init(self, *args, **kwargs)
+
+    def _family_from_type(cls_obj: type) -> str | None:
+        mod = getattr(cls_obj, "__module__", "")
+        parts = mod.split(".")
+        if len(parts) == 3 and parts[0] == "sqlglot" and parts[1] in (
+            "dialects",
+            "parsers",
+            "generators",
+            "typing",
+        ):
+            if parts[2] not in ("__init__", "dialect"):
+                return parts[2]
+        return None
+
+    class _InstPlugin:
+        @pytest.hookimpl(hookwrapper=True)
+        def pytest_runtest_protocol(self, item: Any, nextitem: Any) -> Any:
+            tnum = id_to_num.get(item.nodeid)
+            cur_exprs.clear()
+            cur_dialects.clear()
+            active["num"] = tnum
+            try:
+                yield
+            finally:
+                active["num"] = None
+                if tnum is not None:
+                    for ecls in cur_exprs:
+                        expr_to_tests[ecls.__name__].add(tnum)
+                    for dcls in cur_dialects:
+                        for base in dcls.__mro__:
+                            fam = _family_from_type(base)
+                            if fam:
+                                dialect_to_tests[fam].add(tnum)
+
+    orig_ppe = concurrent.futures.ProcessPoolExecutor
+    concurrent.futures.ProcessPoolExecutor = _InlineExecutor  # type: ignore[misc]
+    Expr.__init__ = _traced_expr_init  # type: ignore[method-assign]
+    Dialect.__init__ = _traced_dialect_init  # type: ignore[method-assign]
+    Dialect.get_or_raise = _traced_get_or_raise  # type: ignore[method-assign]
+    Tokenizer.__init__ = _traced_tok_init  # type: ignore[method-assign]
+    try:
+        exit_code = pytest.main(["tests", "-q", "--disable-warnings"], plugins=[_InstPlugin()])
+        if exit_code not in (0, 5):
+            raise RuntimeError(f"Instantiation trace pytest exited with code {exit_code}")
+    finally:
+        Expr.__init__ = orig_expr_init  # type: ignore[method-assign]
+        Dialect.__init__ = orig_dialect_init  # type: ignore[method-assign]
+        Dialect.get_or_raise = classmethod(orig_get_or_raise)  # type: ignore[method-assign]
+        Tokenizer.__init__ = orig_tok_init  # type: ignore[method-assign]
+        concurrent.futures.ProcessPoolExecutor = orig_ppe  # type: ignore[misc]
+        os.chdir(prev_cwd)
+
+    return expr_to_tests, dialect_to_tests
+
+
 def build_maps(
     sqlglot_commit: str,
     out_dir: Path,
     sqlglot_dir: Path,
     tests_json_path: Path,
     reuse_coverage_from: Path | None = None,
+    instantiations_cache: Path | None = None,
 ) -> dict[str, Any]:
     """Build and write all offline maps to out_dir."""
     sqlglot_dir = ensure_sqlglot_checkout(sqlglot_dir, sqlglot_commit)
@@ -1256,6 +1389,31 @@ def build_maps(
         trees[rel] = ast.parse(path.read_text(encoding="utf-8"), filename=rel)
 
     _static_fixture_scan(sqlglot_dir, py_files, trees, id_to_num, fixture_to_tests)
+    if instantiations_cache is not None and instantiations_cache.is_file():
+        cached_inst = json.loads(instantiations_cache.read_text(encoding="utf-8"))
+        expr_instantiated: dict[str, set[int]] = {
+            k: set(v) for k, v in cached_inst["expr_instantiated"].items()
+        }
+        dialect_instantiated: dict[str, set[int]] = {
+            k: set(v) for k, v in cached_inst["dialect_instantiated"].items()
+        }
+    else:
+        expr_instantiated, dialect_instantiated = collect_runtime_instantiations(
+            sqlglot_dir, id_to_num
+        )
+        if instantiations_cache is not None:
+            instantiations_cache.parent.mkdir(parents=True, exist_ok=True)
+            _write_compact_json(
+                instantiations_cache,
+                {
+                    "expr_instantiated": {
+                        k: sorted(v) for k, v in sorted(expr_instantiated.items())
+                    },
+                    "dialect_instantiated": {
+                        k: sorted(v) for k, v in sorted(dialect_instantiated.items())
+                    },
+                },
+            )
 
     interner = SetInterner()
 
@@ -1274,6 +1432,7 @@ def build_maps(
     global_name_refs: dict[str, set[int]] = defaultdict(set)
     class_to_dialect_family: dict[str, str] = {}
     dialect_edges: list[tuple[str, str]] = []
+    expr_direct_children: dict[str, set[str]] = defaultdict(set)
 
     for rel, tree in trees.items():
         col = _SymbolCollector(rel)
@@ -1295,11 +1454,34 @@ def build_maps(
                 for ln in lines:
                     global_name_refs[name].update(ln_map.get(ln, ()))
         fam = dialect_family_for_file(rel)
-        if fam and rel.startswith("sqlglot/dialects/"):
+        if fam and rel.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/")):
             for cls_name, bases in col.dialect_bases:
-                class_to_dialect_family[cls_name] = fam
+                if cls_name not in ("Parser", "Generator", "Tokenizer"):
+                    class_to_dialect_family[cls_name] = fam
+                    for base in bases:
+                        dialect_edges.append((base, cls_name))
+        if rel.startswith("sqlglot/expressions/"):
+            for cls_name, bases in col.dialect_bases:
                 for base in bases:
-                    dialect_edges.append((base, cls_name))
+                    expr_direct_children[base].add(cls_name)
+
+    expr_descendants: dict[str, set[str]] = {}
+    for cls_name in set(expr_direct_children.keys()) | set(expr_instantiated.keys()):
+        seen_e: set[str] = {cls_name}
+        qe = deque([cls_name])
+        while qe:
+            cur = qe.popleft()
+            for nxt in expr_direct_children.get(cur, ()):
+                if nxt not in seen_e:
+                    seen_e.add(nxt)
+                    qe.append(nxt)
+        seen_e.discard(cls_name)
+        expr_descendants[cls_name] = seen_e
+
+    # Transitive closure over attribute forwarding edges (e.g. COMMENTS -> _COMMENTS -> comments).
+    fwd_adj: dict[str, set[str]] = defaultdict(set)
+    for src_attr, dst_attr in forwarded_edges:
+        fwd_adj[src_attr].add(dst_attr)
 
     effective_runtime_reads: dict[str, set[int]] = {
         k: set(v) for k, v in global_runtime_attr_reads.items()
@@ -1307,13 +1489,21 @@ def build_maps(
     effective_value_reads: dict[str, set[int]] = {
         k: set(v) for k, v in global_runtime_value_reads.items()
     }
-    for src_attr, dst_attr in forwarded_edges:
-        dst_reads = global_runtime_attr_reads.get(dst_attr)
-        if dst_reads:
-            effective_runtime_reads.setdefault(src_attr, set()).update(dst_reads)
-        dst_val_reads = global_runtime_value_reads.get(dst_attr)
-        if dst_val_reads:
-            effective_value_reads.setdefault(src_attr, set()).update(dst_val_reads)
+    for src_attr in fwd_adj:
+        visited_f: set[str] = {src_attr}
+        qf = deque([src_attr])
+        while qf:
+            cur = qf.popleft()
+            for nxt in fwd_adj.get(cur, ()):
+                if nxt not in visited_f:
+                    visited_f.add(nxt)
+                    qf.append(nxt)
+                    dst_reads = global_runtime_attr_reads.get(nxt)
+                    if dst_reads:
+                        effective_runtime_reads.setdefault(src_attr, set()).update(dst_reads)
+                    dst_val_reads = global_runtime_value_reads.get(nxt)
+                    if dst_val_reads:
+                        effective_value_reads.setdefault(src_attr, set()).update(dst_val_reads)
 
     file_to_test_numbers: dict[str, list[int]] = defaultdict(list)
     for t in tests:
@@ -1329,7 +1519,7 @@ def build_maps(
         if b_fam and c_fam and b_fam != c_fam:
             direct_children[b_fam].add(c_fam)
 
-    for fam in set(class_to_dialect_family.values()):
+    for fam in set(class_to_dialect_family.values()) | set(dialect_instantiated.keys()):
         seen: set[str] = {fam}
         q = deque([fam])
         while q:
@@ -1349,6 +1539,8 @@ def build_maps(
             dialect_family_tests[fam].update(
                 file_to_test_numbers.get(f"tests/dialects/test_{fam}.py", ())
             )
+    for fam, inst_tests in dialect_instantiated.items():
+        dialect_family_tests[fam].update(inst_tests)
 
     dialect_family_with_subs: dict[str, set[int]] = {}
     for fam in set(dialect_family_tests.keys()) | set(family_subclasses.keys()):
@@ -1392,6 +1584,23 @@ def build_maps(
             "dialect_family": dialect_family_for_file(rel),
         }
 
+    # Exact transitive import closure of tests/test_dialect_imports.py (Athena + Snowflake lazy imports).
+    di_seeds = [
+        "tests/test_dialect_imports.py",
+        "sqlglot/dialects/__init__.py",
+        "sqlglot/dialects/athena.py",
+        "sqlglot/dialects/snowflake.py",
+    ]
+    di_visited = set(di_seeds)
+    di_q = deque(di_seeds)
+    while di_q:
+        cur = di_q.popleft()
+        for dep in imports_map.get(cur, ()):
+            if dep not in di_visited:
+                di_visited.add(dep)
+                di_q.append(dep)
+    dialect_import_closure = sorted(f for f in di_visited if f.startswith("sqlglot/"))
+
     # Map every symbol and line in coverage_map.json
     line_to_set: dict[str, dict[str, int]] = {}
     for rel in sorted(line_to_tests):
@@ -1403,6 +1612,21 @@ def build_maps(
         if ln_dict:
             line_to_set[rel] = ln_dict
 
+    qn_tsets_by_file: dict[str, dict[str, set[int]]] = {}
+    expr_qn_tests: dict[str, set[int]] = defaultdict(set)
+    for rel, _ in py_files:
+        col = collectors[rel]
+        ln_map = line_to_tests.get(rel, {})
+        qn_tsets: dict[str, set[int]] = defaultdict(set)
+        for qn, _kind, start, end in col.symbols:
+            for ln in range(start, end + 1):
+                qn_tsets[qn].update(ln_map.get(ln, ()))
+        qn_tsets_by_file[rel] = qn_tsets
+        if rel.startswith("sqlglot/expressions/"):
+            for qn, tset in qn_tsets.items():
+                top = qn.split(".", 1)[0]
+                expr_qn_tests[top].update(tset)
+
     qualname_to_set: dict[str, dict[str, int]] = {}
     import_time_qualnames: dict[str, list[str]] = {}
     file_to_set: dict[str, int] = {}
@@ -1411,10 +1635,14 @@ def build_maps(
     for rel, path in py_files:
         col = collectors[rel]
         ln_map = line_to_tests.get(rel, {})
-        qn_tsets: dict[str, set[int]] = defaultdict(set)
-        for qn, _kind, start, end in col.symbols:
-            for ln in range(start, end + 1):
-                qn_tsets[qn].update(ln_map.get(ln, ()))
+        qn_tsets = qn_tsets_by_file[rel]
+        local_func_tests: dict[str, set[int]] = {}
+        for qn, kind, _s, _e in col.symbols:
+            if kind in ("function", "method"):
+                leaf = qn.rsplit(".", 1)[-1]
+                local_func_tests.setdefault(qn, set()).update(qn_tsets.get(qn, ()))
+                local_func_tests.setdefault(leaf, set()).update(qn_tsets.get(qn, ()))
+
         qn_sets: dict[str, int] = {}
         for qn, tset in sorted(qn_tsets.items()):
             sid = interner.intern(tset)
@@ -1444,6 +1672,14 @@ def build_maps(
         for tf in import_graph_modules[rel]["transitive_test_files"]:
             trans_tests.update(file_to_test_numbers.get(tf, ()))
 
+        def _ref_func_tests(refs: tuple[str, ...]) -> set[int]:
+            out_r: set[int] = set()
+            for r in refs:
+                tset = local_func_tests.get(r)
+                if tset:
+                    out_r.update(tset)
+            return out_r
+
         def resolve_attr_tests(
             attr_name: str,
             start: int,
@@ -1451,33 +1687,65 @@ def build_maps(
             cls_leaf: str | None,
             callee: str | None,
             has_callable: bool,
+            val_refs: tuple[str, ...],
         ) -> set[int]:
-            if has_callable:
-                span_tests: set[int] = set()
-                for ln in range(start, end + 1):
-                    span_tests.update(ln_map.get(ln, ()))
-                if span_tests:
-                    return span_tests
-            reader_tests = effective_runtime_reads.get(attr_name) or global_attr_reads.get(
+            span_tests: set[int] = set()
+            for ln in range(start, end + 1):
+                span_tests.update(ln_map.get(ln, ()))
+            ref_tests = _ref_func_tests(val_refs)
+            reader_tests = effective_runtime_reads.get(attr_name, set()) | global_attr_reads.get(
                 attr_name, set()
             )
+
+            if rel.startswith("sqlglot/expressions/") and cls_leaf:
+                cls_tests: set[int] = set(span_tests) | ref_tests
+                for cname in (cls_leaf, *expr_descendants.get(cls_leaf, ())):
+                    cls_tests.update(expr_instantiated.get(cname, ()))
+                    cls_tests.update(global_name_refs.get(cname, ()))
+                    cls_tests.update(expr_qn_tests.get(cname, ()))
+                if attr_name != "arg_types" and reader_tests:
+                    if len(reader_tests) <= 100:
+                        cls_tests.update(reader_tests)
+                    elif cls_tests:
+                        cls_tests.update(reader_tests & cls_tests)
+                if cls_tests:
+                    return cls_tests
+                return set(file_to_tests.get(rel) or trans_tests)
+
+            # Dialect component class bindings (Parser/Generator/Tokenizer) are wired by _Dialect.__new__.
+            if fam_tests and attr_name in ("Parser", "Generator", "Tokenizer"):
+                return set(fam_tests) | span_tests | ref_tests
+
+            # Core enums and BaseParser tables are broadly referenced across parsers/tokenizers.
+            if cls_leaf in ("TokenType", "ErrorLevel") or rel == "sqlglot/parsers/base.py":
+                out_enum = (
+                    set(file_to_tests.get(rel) or trans_tests)
+                    | reader_tests
+                    | span_tests
+                    | ref_tests
+                )
+                if cls_leaf:
+                    out_enum.update(global_name_refs.get(cls_leaf, ()))
+                return out_enum
+
             if fam_tests:
                 if reader_tests:
                     inter = reader_tests & fam_tests
-                    if inter:
-                        return inter
-                return fam_tests
-            if reader_tests and len(reader_tests) <= 100:
-                return set(reader_tests)
+                    base = set(inter) if inter else set(fam_tests)
+                else:
+                    base = set(fam_tests)
+                return base | span_tests | ref_tests
+
+            if reader_tests:
+                out_core = set(reader_tests) | span_tests | ref_tests
+                if cls_leaf:
+                    out_core.update(global_name_refs.get(cls_leaf, ()))
+                return out_core
             if cls_leaf:
                 cls_refs = global_name_refs.get(cls_leaf, set())
                 if cls_refs:
-                    return cls_refs
-            if reader_tests and file_to_tests.get(rel):
-                inter = reader_tests & file_to_tests[rel]
-                if inter:
-                    return inter
-            return file_to_tests.get(rel) or trans_tests
+                    return set(cls_refs) | span_tests | ref_tests
+            return set(file_to_tests.get(rel) or trans_tests) | span_tests | ref_tests
 
         def build_attr_entry(
             attr_name: str, info: dict[str, Any], cls_leaf: str | None
@@ -1489,25 +1757,33 @@ def build_maps(
                 cls_leaf,
                 info["callee"],
                 info["has_callable"],
+                info.get("val_refs", ()),
             )
-            val_readers = effective_value_reads.get(attr_name)
-            if val_readers:
-                if fam_tests:
-                    inter = val_readers & fam_tests
-                    dict_val_tests = inter if inter else attr_tests
-                elif len(val_readers) <= 100:
-                    dict_val_tests = set(val_readers)
-                else:
-                    dict_val_tests = val_readers & attr_tests or attr_tests
+            if rel.startswith("sqlglot/expressions/") and cls_leaf:
+                dict_val_tests = set(attr_tests)
             else:
-                dict_val_tests = attr_tests
+                val_readers = effective_value_reads.get(attr_name)
+                if val_readers:
+                    if fam_tests:
+                        inter = val_readers & fam_tests
+                        dict_val_tests = set(inter) if inter else set(attr_tests)
+                    else:
+                        inter = val_readers & attr_tests
+                        dict_val_tests = set(inter) if inter else set(val_readers)
+                else:
+                    dict_val_tests = set(attr_tests)
             dk_out: dict[str, list[int]] = {}
-            for k_str, (ks, ke, _k_callee, k_callable) in sorted(info["dict_keys"].items()):
+            for k_str, (ks, ke, _k_callee, k_callable, k_refs) in sorted(info["dict_keys"].items()):
                 k_span: set[int] = set()
                 if k_callable:
                     for ln in range(ks, ke + 1):
                         k_span.update(ln_map.get(ln, ()))
-                k_tests = k_span if k_span else dict_val_tests
+                k_ref_t = _ref_func_tests(k_refs)
+                if k_callable and k_span:
+                    k_tests = k_span | k_ref_t
+                else:
+                    k_tests = dict_val_tests | k_ref_t
+                attr_tests.update(k_tests)
                 dk_out[k_str] = [ks, ke, interner.intern(k_tests)]
             return {
                 "start": info["start"],
@@ -1572,6 +1848,7 @@ def build_maps(
     import_graph_data = {
         "modules": import_graph_modules,
         "dialect_families": dialect_families_out,
+        "dialect_import_closure": dialect_import_closure,
         "dialect_subclasses": {
             k: sorted(v) for k, v in sorted(family_subclasses.items()) if v
         },
@@ -1606,6 +1883,7 @@ def main() -> int:
         default=Path("../sample-kit/sample/tests.json"),
     )
     parser.add_argument("--reuse-coverage-from", type=Path, default=None)
+    parser.add_argument("--instantiations-cache", type=Path, default=None)
     args = parser.parse_args()
     summary = build_maps(
         sqlglot_commit=args.sqlglot_commit,
@@ -1613,6 +1891,7 @@ def main() -> int:
         sqlglot_dir=args.sqlglot_dir,
         tests_json_path=args.tests_json,
         reuse_coverage_from=args.reuse_coverage_from,
+        instantiations_cache=args.instantiations_cache,
     )
     print(f"Built maps: {summary}", file=sys.stderr)
     return 0

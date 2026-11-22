@@ -28,13 +28,19 @@ with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
     tf.extractall("/opt", filter="data")
 shutil.move(f"/opt/sqlglot-{commit}", "/opt/sqlglot")
 PY
-RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests \
-    && chmod -R a+rX /opt/sqlglot /app
+RUN python -m compileall -q /usr/local/lib/python3.13 /opt/sqlglot/sqlglot /opt/sqlglot/tests \
+    && chmod -R a+rX /usr/local/lib/python3.13 /opt/sqlglot /app
 
 FROM base AS runtime
 
+ENV MAPS_CACHE=/app/maps_cache.marshal \
+    REPO_WORD_INDEX=/app/repo_word_index.marshal
+
 COPY maps/ /app/maps/
 COPY src/ /app/src/
-RUN chmod -R a+rX /app/maps /app/src
+RUN python -m compileall -q /app/src \
+    && chmod -R a+rX /app/maps /app/src \
+    && PYTHONPATH=/app/src python -c "from pathlib import Path; import diff_analyzer, selector; selector.write_maps_cache(Path('/app/maps'), Path('/app/maps_cache.marshal')); diff_analyzer.write_repo_word_index(Path('/opt/sqlglot'), Path('/app/repo_word_index.marshal'))" \
+    && chmod a+r /app/maps_cache.marshal /app/repo_word_index.marshal
 
 CMD ["python", "/app/src/main.py"]

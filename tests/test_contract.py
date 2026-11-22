@@ -1380,3 +1380,210 @@ def test_class_cleanup_failure_eager_map_and_lazy_heavy_submodules(tmp_path: Pat
     )
     res = subprocess.run([sys.executable, "-c", probe_code], capture_output=True, text=True)
     assert res.returncode == 0, f"lazy heavy submodule probe failed: {res.stderr}"
+
+
+def test_verifier_early_exit_preserves_unverified_and_failed_tests(tmp_path: Path) -> None:
+    repo = tmp_path / "early_exit_repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    marker = tmp_path / "ran.log"
+    (repo / "tests" / "test_early.py").write_text(
+        textwrap.dedent(
+            f"""\
+            import unittest
+            from pathlib import Path
+
+            MARKER = Path({str(marker)!r})
+
+            class TestEarly(unittest.TestCase):
+                def test_fast_fail(self):
+                    with MARKER.open("a", encoding="utf-8") as fh:
+                        fh.write("fast_fail\\n")
+                    self.fail("intentional")
+
+                def test_slow_unrun_fail(self):
+                    with MARKER.open("a", encoding="utf-8") as fh:
+                        fh.write("slow_unrun_fail\\n")
+                    self.fail("must remain kept even when skipped")
+
+                def test_slow_unrun_pass(self):
+                    with MARKER.open("a", encoding="utf-8") as fh:
+                        fh.write("slow_unrun_pass\\n")
+                    self.assertTrue(True)
+            """
+        ),
+        encoding="utf-8",
+    )
+    tmp_ov = tmp_path / "ee_ov"
+    tmp_ov.mkdir()
+
+    # Failure-triggered early exit: test 0 (10ms) runs first and fails; remaining tests 1+2 (160ms)
+    # yield residual gain 160ms < MIN_RESIDUAL_GAIN_MS, so verification stops immediately and keeps
+    # both the failed test AND all unverified tests.
+    ms_by_num = {0: 10, 1: 80, 2: 80, 3: 15_000}
+    id_by_num = {
+        0: "tests/test_early.py::TestEarly::test_fast_fail",
+        1: "tests/test_early.py::TestEarly::test_slow_unrun_fail",
+        2: "tests/test_early.py::TestEarly::test_slow_unrun_pass",
+        3: "tests/test_early.py::TestEarly::test_kept_huge",
+    }
+    file_by_num = {n: "tests/test_early.py" for n in ms_by_num}
+    file_to_tests = {"tests/test_early.py": frozenset(ms_by_num)}
+
+    an = CommitAnalysis("c_fail_ee", patched_contents={})
+    outcomes = verify_batch(
+        analyses={"c_fail_ee": an},
+        candidate_sets={"c_fail_ee": frozenset({0, 1, 2})},
+        sqlglot_root=repo,
+        ms_by_num=ms_by_num,
+        id_by_num=id_by_num,
+        file_by_num=file_by_num,
+        file_to_tests=file_to_tests,
+        tmp_base=str(tmp_ov),
+        force_verify_all=True,
+    )
+    assert outcomes["c_fail_ee"].final_tests == frozenset({0, 1, 2})
+    assert marker.read_text(encoding="utf-8").splitlines() == ["fast_fail"]
+
+    # keep_unverified-triggered early exit: test 3 (15_000ms) is in keep_unverified, so remaining
+    # ordinary tests 1+2 (300ms) have residual gain 300ms < MIN_RESIDUAL_GAIN_MS; child exits
+    # before running any test and preserves 100% of keep_unverified + unverified candidates.
+    marker.unlink()
+    from verifier import VerifyPlan, _run_fork_queue
+
+    plan = VerifyPlan(
+        keep_unverified=frozenset({3}),
+        to_verify=frozenset({1, 2}),
+        est_cpu_ms=400,
+        max_sim_gain_ms=300,
+        should_verify=True,
+        use_preloaded_sqlglot=False,
+        fast_tpcds=False,
+    )
+    ku_outcomes: dict = {}
+    _run_fork_queue(
+        [("c_ku_ee", an, frozenset({1, 2, 3}), plan)],
+        ku_outcomes,
+        repo,
+        id_by_num,
+        file_to_tests,
+        (),
+        5.0,
+        10**9,
+        1,
+        str(tmp_ov),
+        ms_by_num,
+    )
+    assert ku_outcomes["c_ku_ee"].final_tests == frozenset({1, 2, 3})
+    assert not marker.exists()
+    assert list(tmp_ov.iterdir()) == []
+
+
+def test_ordinary_failure_skips_remaining_ordinary_but_still_runs_fast_tpcds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import verifier
+
+    repo = tmp_path / "tpcds_jump_repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    marker = tmp_path / "jump.log"
+    (repo / "tests" / "test_jump.py").write_text(
+        textwrap.dedent(
+            f"""\
+            import unittest
+            from pathlib import Path
+
+            MARKER = Path({str(marker)!r})
+
+            class TestJump(unittest.TestCase):
+                def test_fail_first(self):
+                    with MARKER.open("a", encoding="utf-8") as fh:
+                        fh.write("fail_first\\n")
+                    self.fail("boom")
+
+                def test_skip_second(self):
+                    with MARKER.open("a", encoding="utf-8") as fh:
+                        fh.write("skip_second\\n")
+                    self.assertTrue(True)
+            """
+        ),
+        encoding="utf-8",
+    )
+    tpcds_called = tmp_path / "tpcds_called.txt"
+
+    def fake_fast_tpcds(hashes, soft_deadline_s):
+        tpcds_called.write_text("ran", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(verifier, "_fast_verify_tpcds", fake_fast_tpcds)
+
+    ms_by_num = {0: 10, 1: 100, 1106: 21_454}
+    id_by_num = {
+        0: "tests/test_jump.py::TestJump::test_fail_first",
+        1: "tests/test_jump.py::TestJump::test_skip_second",
+        1106: "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+    }
+    file_to_tests = {
+        "tests/test_jump.py": frozenset({0, 1}),
+        "tests/test_executor.py": frozenset({1106}),
+    }
+    tmp_ov = tmp_path / "ov"
+    tmp_ov.mkdir()
+
+    an = CommitAnalysis("c_jump", patched_contents={})
+    plan = verifier.VerifyPlan(
+        keep_unverified=frozenset(),
+        to_verify=frozenset({0, 1, 1106}),
+        est_cpu_ms=3_500,
+        max_sim_gain_ms=23_564,
+        should_verify=True,
+        use_preloaded_sqlglot=False,
+        fast_tpcds=True,
+    )
+    outcomes: dict = {}
+    verifier._run_fork_queue(
+        [("c_jump", an, frozenset({0, 1, 1106}), plan)],
+        outcomes,
+        repo,
+        id_by_num,
+        file_to_tests,
+        ("dummy_hash",),
+        5.0,
+        10**9,
+        1,
+        str(tmp_ov),
+        ms_by_num,
+    )
+    # fast_tpcds runs first and sheds #1106 -> test 0 fails -> test 1 skipped (kept unverified!)
+    assert outcomes["c_jump"].final_tests == frozenset({0, 1})
+    assert marker.read_text(encoding="utf-8").splitlines() == ["fail_first"]
+    assert tpcds_called.read_text(encoding="utf-8") == "ran"
+
+    # When fast_tpcds FAILS, kept={1106} triggers early exit BEFORE running unworthwhile ordinary tests!
+    marker.unlink()
+    tpcds_called.unlink()
+
+    def fake_fast_tpcds_fail(hashes, soft_deadline_s):
+        tpcds_called.write_text("failed", encoding="utf-8")
+        return False
+
+    monkeypatch.setattr(verifier, "_fast_verify_tpcds", fake_fast_tpcds_fail)
+    outcomes_fail: dict = {}
+    verifier._run_fork_queue(
+        [("c_jump_fail", an, frozenset({0, 1, 1106}), plan)],
+        outcomes_fail,
+        repo,
+        id_by_num,
+        file_to_tests,
+        ("dummy_hash",),
+        5.0,
+        10**9,
+        1,
+        str(tmp_ov),
+        ms_by_num,
+    )
+    assert outcomes_fail["c_jump_fail"].final_tests == frozenset({0, 1, 1106})
+    assert not marker.exists()
+    assert tpcds_called.read_text(encoding="utf-8") == "failed"
+    assert list(tmp_ov.iterdir()) == []

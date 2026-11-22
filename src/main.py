@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import resource
@@ -72,6 +73,7 @@ def run_pipeline(
     *,
     enable_verify: bool = True,
     tmp_base: str = "/tmp",
+    maps_cache: Path | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
     """Run diff analysis, coverage selection, cost-aware verification, and scheduling."""
     t0 = time.perf_counter()
@@ -81,7 +83,7 @@ def run_pipeline(
     file_by_num = {t["number"]: t["file"] for t in tests_raw}
     valid_test_nums = set(ms_by_num.keys())
 
-    selector = BlastSelector(maps_dir, runtime_tests=tests_raw)
+    selector = BlastSelector(maps_dir, runtime_tests=tests_raw, cache_path=maps_cache)
 
     commits_dir = data_dir / "commits"
     patch_paths = sorted(commits_dir.glob("*.patch"), key=lambda p: p.name)
@@ -159,6 +161,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data-dir", type=Path, default=Path(os.environ.get("DATA_DIR", "/data")))
     parser.add_argument("--maps-dir", type=Path, default=Path(os.environ.get("MAPS_DIR", "/app/maps")))
     parser.add_argument(
+        "--maps-cache",
+        type=Path,
+        default=Path(os.environ["MAPS_CACHE"]) if os.environ.get("MAPS_CACHE") else None,
+    )
+    parser.add_argument(
         "--sqlglot-root",
         type=Path,
         default=Path(os.environ.get("SQLGLOT_ROOT", "/opt/sqlglot")),
@@ -170,11 +177,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # The parent only builds acyclic ASTs and lookup tables, so cyclic GC passes are pure overhead;
+    # verification children turn collection back on before running any test.
+    gc.disable()
     payload, stats = run_pipeline(
         data_dir=args.data_dir,
         maps_dir=args.maps_dir,
         sqlglot_root=args.sqlglot_root,
         enable_verify=not args.no_verify,
+        maps_cache=args.maps_cache,
     )
     sys.stdout.buffer.write(payload)
     sys.stdout.buffer.flush()
@@ -183,4 +194,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_code = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # Every child has been reaped and every overlay removed; skip freeing the parent's heap object by object.
+    os._exit(exit_code)

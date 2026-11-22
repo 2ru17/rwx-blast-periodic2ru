@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import ast
+import marshal
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_WORD_RE = re.compile(r"\w+")
 
 
 @dataclass(frozen=True, slots=True)
@@ -481,28 +485,93 @@ def _parse_repo_tree(sqlglot_root: Path, rel: str, raw: str) -> ast.Module | Non
     return tree
 
 
+def _iter_repo_py_files(sqlglot_root: Path) -> list[str]:
+    return [
+        path.relative_to(sqlglot_root).as_posix()
+        for path in sorted(sqlglot_root.rglob("*.py"))
+        if "__pycache__" not in path.parts
+    ]
+
+
+def build_repo_word_index(sqlglot_root: Path) -> dict[str, Any]:
+    """Map every maximal \\w+ run in the repo's .py files to the indices of the files containing it."""
+    files = _iter_repo_py_files(sqlglot_root)
+    words: dict[str, list[int]] = {}
+    for idx, rel in enumerate(files):
+        raw = (sqlglot_root / rel).read_text(encoding="utf-8", errors="replace")
+        for word in set(_WORD_RE.findall(raw)):
+            words.setdefault(word, []).append(idx)
+    return {"root": str(sqlglot_root), "files": files, "words": {w: tuple(ids) for w, ids in words.items()}}
+
+
+def write_repo_word_index(sqlglot_root: Path, out_path: Path) -> None:
+    """Build-time only: the pinned checkout is immutable inside the image, so the index never goes stale."""
+    out_path.write_bytes(marshal.dumps(build_repo_word_index(sqlglot_root)))
+
+
+_REPO_WORD_INDEX: dict[str, tuple[list[str], dict[str, tuple[int, ...]]] | None] = {}
+
+
+def _repo_word_index(sqlglot_root: Path) -> tuple[list[str], dict[str, tuple[int, ...]]] | None:
+    key = str(sqlglot_root)
+    if key not in _REPO_WORD_INDEX:
+        loaded = None
+        index_path = os.environ.get("REPO_WORD_INDEX")
+        if index_path:
+            try:
+                data = marshal.loads(Path(index_path).read_bytes())
+                if data["root"] == key:
+                    loaded = (data["files"], data["words"])
+            except (OSError, EOFError, ValueError, TypeError, KeyError):
+                loaded = None
+        _REPO_WORD_INDEX[key] = loaded
+    return _REPO_WORD_INDEX[key]
+
+
+def _bounded_start(word: str) -> str:
+    """Regex source equivalent to `\\b<word>` that begins with the literal, so `re` can skip to it.
+
+    A leading `\\b` makes `re` try a match at every offset; for an all-\\w word the boundary before it
+    is exactly "the preceding character is not \\w", which the lookbehind checks after the literal.
+    """
+    esc = re.escape(word)
+    return f"{esc}(?<!\\w{esc})" if _WORD_RE.fullmatch(word) else rf"\b{esc}"
+
+
 def _iter_repo_trees_containing(
     needles: tuple[str, ...],
     sqlglot_root: Path,
     patched_trees: dict[str, ast.Module],
-    prefilter: re.Pattern[str] | None = None,
+    prefilter: tuple[re.Pattern[str], ...] = (),
 ) -> list[tuple[str, ast.Module]]:
+    """Patched trees plus repo files holding a needle as a whole word; with a prefilter, a file is kept
+    when any of its patterns matches (the patterns are the alternatives of one disjunction)."""
     out: list[tuple[str, ast.Module]] = []
     seen: set[str] = set()
     for rel, p_tree in patched_trees.items():
         seen.add(rel)
         out.append((rel, p_tree))
-    word_re = re.compile(r"\b(?:" + "|".join(re.escape(n) for n in needles) + r")\b")
-    for path in sorted(sqlglot_root.rglob("*.py")):
-        if "__pycache__" in path.parts:
-            continue
-        rel = path.relative_to(sqlglot_root).as_posix()
+    # For a needle made only of word characters, `\bneedle\b` matches a text exactly when the needle
+    # is one of the text's maximal \w+ runs, so the index yields the same files as the regex scan.
+    index = (
+        _repo_word_index(sqlglot_root)
+        if needles and all(_WORD_RE.fullmatch(n) for n in needles)
+        else None
+    )
+    word_re: re.Pattern[str] | None = None
+    if index is not None:
+        files, words = index
+        candidates = [files[i] for i in sorted({i for n in needles for i in words.get(n, ())})]
+    else:
+        candidates = _iter_repo_py_files(sqlglot_root)
+        word_re = re.compile(r"\b(?:" + "|".join(re.escape(n) for n in needles) + r")\b")
+    for rel in candidates:
         if rel in seen:
             continue
-        raw = path.read_text(encoding="utf-8", errors="replace")
-        if not word_re.search(raw):
+        raw = (sqlglot_root / rel).read_text(encoding="utf-8", errors="replace")
+        if word_re is not None and not word_re.search(raw):
             continue
-        if prefilter is not None and not prefilter.search(raw):
+        if prefilter and not any(p.search(raw) for p in prefilter):
             continue
         tree = _parse_repo_tree(sqlglot_root, rel, raw)
         if tree is not None:
@@ -525,11 +594,11 @@ def _has_unsafe_subclass_in_repo(
             break
         checked.update(batch)
         pat = "|".join(re.escape(n) for n in batch)
-        sub_prefilter = re.compile(
-            rf"(?:\bclass\s+\w+\s*\([^:]{{0,300}}\b(?:{pat})\b"
-            rf"|\b(?:{pat})\s+as\s+\w+"
-            rf"|\b(?:{pat})\s*\.\s*__(?:eq|ne)__"
-            rf"|\bsetattr\s*\([^,\n]{{0,120}}\b(?:{pat})\b)"
+        sub_prefilter = (
+            re.compile(_bounded_start("class") + rf"\s+\w+\s*\([^:]{{0,300}}\b(?:{pat})\b"),
+            *(re.compile(_bounded_start(n) + r"\s+as\s+\w+") for n in batch),
+            *(re.compile(_bounded_start(n) + r"\s*\.\s*__(?:eq|ne)__") for n in batch),
+            re.compile(_bounded_start("setattr") + rf"\s*\([^,\n]{{0,120}}\b(?:{pat})\b"),
         )
         next_frontier: set[str] = set()
         for rel, tree in _iter_repo_trees_containing(
@@ -1317,11 +1386,11 @@ def _verify_repo_wide_mapping_closed(
 ) -> bool:
     """Verify no repo/patched file mutates .<map_attr>, reassigns it externally, or passes non-T dict literals."""
     ma_esc = re.escape(map_attr)
-    oc_esc = re.escape(owner_cls_name)
-    prefilter = re.compile(
-        rf"(?:\.{ma_esc}\s*(?:\[|\.\s*(?:update|setdefault|pop|popitem|clear)\b|[|]?=)"
-        rf"|\b(?:setattr|delattr)\s*\("
-        rf"|\b{oc_esc}\b)"
+    prefilter = (
+        re.compile(rf"\.{ma_esc}\s*(?:\[|\.\s*(?:update|setdefault|pop|popitem|clear)\b|[|]?=)"),
+        re.compile(_bounded_start("setattr") + r"\s*\("),
+        re.compile(_bounded_start("delattr") + r"\s*\("),
+        re.compile(_bounded_start(owner_cls_name) + r"\b"),
     )
     for rel, tree in _iter_repo_trees_containing(
         (map_attr, owner_cls_name), sqlglot_root, patched_trees, prefilter=prefilter
@@ -1632,15 +1701,34 @@ def _statement_header_lines(tree: ast.Module, target_lines: set[int]) -> set[int
         return set()
     expanded = set(target_lines)
     for node in ast.walk(tree):
-        if isinstance(node, (ast.If, ast.While)):
-            test_start = node.test.lineno
-            test_end = node.test.end_lineno or test_start
-            if any(test_start <= ln <= test_end for ln in target_lines):
-                expanded.update(range(node.lineno, test_end + 1))
-        elif isinstance(node, ast.For):
-            iter_end = node.iter.end_lineno or node.lineno
-            if any(node.lineno <= ln <= iter_end for ln in target_lines):
-                expanded.update(range(node.lineno, iter_end + 1))
+        if isinstance(
+            node,
+            (
+                ast.If,
+                ast.While,
+                ast.For,
+                ast.AsyncFor,
+                ast.With,
+                ast.AsyncWith,
+                ast.Try,
+                ast.TryStar,
+                ast.ExceptHandler,
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+            ),
+        ):
+            header_end = max(node.lineno, node.body[0].lineno - 1)
+            if any(node.lineno <= ln <= header_end for ln in target_lines):
+                expanded.update(range(node.lineno, header_end + 1))
+        elif isinstance(node, ast.Match):
+            header_end = max(node.lineno, node.cases[0].pattern.lineno - 1)
+            if any(node.lineno <= ln <= header_end for ln in target_lines):
+                expanded.update(range(node.lineno, header_end + 1))
+            for case in node.cases:
+                start = case.pattern.lineno
+                end = max(start, case.body[0].lineno - 1)
+                if any(start <= ln <= end for ln in target_lines):
+                    expanded.update(range(start, end + 1))
         elif isinstance(
             node,
             (
@@ -1902,22 +1990,59 @@ def _diff_attr_map(
     return changes
 
 
-def _enclosing_func_for_line(
-    funcs: dict[str, list[tuple[int, int, ast.AST]]], ln: int
-) -> str | None:
-    best_qn: str | None = None
-    best_span = 10**9
-    for qn, defs in funcs.items():
-        for start, end, _ in defs:
-            if start <= ln <= end:
-                span = end - start
-                if span < best_span:
-                    best_span = span
-                    best_qn = qn
-    return best_qn
-
-
 _BASE_PARSE_CACHE: dict[tuple[str, str], tuple[str, ast.Module, _TreeSummary]] = {}
+_COMMENT_OR_BLANK_RE = re.compile(r"[ \t\f]*(?:#.*)?")
+_STRING_NODE_TYPES = tuple(
+    t for t in (ast.Constant, ast.JoinedStr, getattr(ast, "TemplateStr", None)) if t is not None
+)
+_MULTILINE_STRING_SPANS: dict[ast.Module, list[tuple[int, int]]] = {}
+
+
+def _comment_only_change(before_src: str, before_tree: ast.Module, after_src: str) -> bool:
+    """True when after_src is before_src with only comment or blank lines added, removed, or edited.
+
+    Both files must keep identical code lines in identical order; each differing comment/blank block
+    must sit outside every multi-line string and not follow a backslash continuation, and lines 1-2
+    (the encoding cookie) must be unchanged. The tokenizer then yields the same tokens apart from
+    COMMENT/NL, so the two files parse to the same AST.
+    """
+    if before_src == after_src:
+        return True
+    if "\r" in before_src or "\r" in after_src:
+        return False
+    b_lines = before_src.split("\n")
+    a_lines = after_src.split("\n")
+    if b_lines[:2] != a_lines[:2]:
+        return False
+    b_code = [i for i, ln in enumerate(b_lines) if not _COMMENT_OR_BLANK_RE.fullmatch(ln)]
+    a_code = [i for i, ln in enumerate(a_lines) if not _COMMENT_OR_BLANK_RE.fullmatch(ln)]
+    if len(b_code) != len(a_code) or any(b_lines[i] != a_lines[j] for i, j in zip(b_code, a_code)):
+        return False
+    spans = _MULTILINE_STRING_SPANS.get(before_tree)
+    if spans is None:
+        spans = [
+            (node.lineno, node.end_lineno)
+            for node in ast.walk(before_tree)
+            if isinstance(node, _STRING_NODE_TYPES)
+            and node.end_lineno is not None
+            and node.end_lineno > node.lineno
+        ]
+        _MULTILINE_STRING_SPANS[before_tree] = spans
+    b_bounds = [-1, *b_code, len(b_lines)]
+    a_bounds = [-1, *a_code, len(a_lines)]
+    for k in range(len(b_bounds) - 1):
+        b_block = b_lines[b_bounds[k] + 1 : b_bounds[k + 1]]
+        a_block = a_lines[a_bounds[k] + 1 : a_bounds[k + 1]]
+        if b_block == a_block:
+            continue
+        if b_bounds[k] < 0:
+            continue
+        prev_ln = b_bounds[k] + 1
+        if b_lines[b_bounds[k]].endswith("\\"):
+            return False
+        if any(s <= prev_ln < e for s, e in spans):
+            return False
+    return True
 
 
 def _load_base_python(sqlglot_root: Path, rel_path: str) -> tuple[str, ast.Module, _TreeSummary] | None:
@@ -1928,8 +2053,12 @@ def _load_base_python(sqlglot_root: Path, rel_path: str) -> tuple[str, ast.Modul
     path = sqlglot_root / rel_path
     if not path.is_file():
         return None
-    src = path.read_text(encoding="utf-8", errors="replace")
-    tree = ast.parse(src, filename=rel_path)
+    src_bytes = path.read_bytes()
+    src = src_bytes.decode("utf-8", errors="replace")
+    try:
+        tree = ast.parse(src_bytes, filename=rel_path)
+    except (SyntaxError, ValueError):
+        return None
     summary = _summarize_tree(tree)
     entry = (src, tree, summary)
     _BASE_PARSE_CACHE[key] = entry
@@ -1963,7 +2092,10 @@ def analyze_patch(commit_id: str, patch_text: str, sqlglot_root: Path) -> Commit
     raw_files = parse_unified_diff(patch_text)
 
     patched_trees: dict[str, ast.Module] = {}
-    for rf in raw_files:
+    patched_python: dict[int, tuple[str, ast.Module | None]] = {}
+    comment_only: set[int] = set()
+    python_sources: list[tuple[int, str, str]] = []
+    for idx, rf in enumerate(raw_files):
         if rf.is_binary or rf.is_deleted:
             continue
         rel_p = rf.new_path or rf.old_path
@@ -1972,13 +2104,29 @@ def analyze_patch(commit_id: str, patch_text: str, sqlglot_root: Path) -> Commit
         b_loaded = None if rf.is_new or not rf.old_path else _load_base_python(sqlglot_root, rf.old_path)
         b_src = b_loaded[0] if b_loaded is not None else ""
         a_src = apply_hunks(b_src, rf.hunks)
-        try:
-            a_tree = ast.parse(a_src, filename=rel_p)
-            patched_trees[rel_p] = a_tree
-        except (SyntaxError, ValueError):
-            pass
+        if (
+            b_loaded is not None
+            and not rf.is_new
+            and not rf.is_renamed
+            and "\ufffd" not in b_src
+            and _comment_only_change(b_src, b_loaded[1], a_src)
+        ):
+            comment_only.add(idx)
+        python_sources.append((idx, rel_p, a_src))
 
-    for rf in raw_files:
+    # Patched trees are only read by the closed-world checks of files with real code changes.
+    parse_patched = len(comment_only) < len(python_sources)
+    for idx, rel_p, a_src in python_sources:
+        a_tree: ast.Module | None = None
+        if parse_patched:
+            try:
+                a_tree = ast.parse(a_src.encode("utf-8"), filename=rel_p)
+                patched_trees[rel_p] = a_tree
+            except (SyntaxError, ValueError):
+                a_tree = None
+        patched_python[idx] = (a_src, a_tree)
+
+    for idx, rf in enumerate(raw_files):
         rel_path = rf.old_path if rf.is_deleted else (rf.new_path or rf.old_path)
         is_python = rel_path.endswith(".py") or rf.old_path.endswith(".py")
 
@@ -2016,18 +2164,38 @@ def analyze_patch(commit_id: str, patch_text: str, sqlglot_root: Path) -> Commit
 
         base_loaded = None if rf.is_new or not rf.old_path else _load_base_python(sqlglot_root, rf.old_path)
         before_src = base_loaded[0] if base_loaded is not None else ""
-        after_src = apply_hunks(before_src, rf.hunks)
+        # The first pass already applied and parsed exactly this (base, hunks) pair.
+        after_src, parsed_after = patched_python[idx]
         if rf.is_renamed and rf.old_path and rf.old_path != rf.new_path:
             result.patched_contents[rf.old_path] = None
         result.patched_contents[rel_path] = after_src
 
-        try:
-            after_tree = ast.parse(after_src, filename=rel_path)
-        except (SyntaxError, ValueError):
+        # A replacement character or unparseable base file fails closed as syntax_broken.
+        if (base_loaded is not None and "\ufffd" in before_src) or (
+            base_loaded is None
+            and not rf.is_new
+            and rf.old_path
+            and (sqlglot_root / rf.old_path).is_file()
+        ):
             result.files.append(
                 _make_file_analysis(rf, rel_path, True, syntax_broken=True, raw_text_changed=True)
             )
             continue
+
+        if idx in comment_only:
+            result.files.append(
+                _make_file_analysis(
+                    rf, rel_path, True, is_ast_noop=True, raw_text_changed=before_src != after_src
+                )
+            )
+            continue
+
+        if parsed_after is None:
+            result.files.append(
+                _make_file_analysis(rf, rel_path, True, syntax_broken=True, raw_text_changed=True)
+            )
+            continue
+        after_tree = parsed_after
 
         if rf.is_new or base_loaded is None:
             result.files.append(
@@ -2180,23 +2348,16 @@ def analyze_patch(commit_id: str, patch_text: str, sqlglot_root: Path) -> Commit
             if h.deleted_lines:
                 for ln, _ in h.deleted_lines:
                     changed_old_lines.add(ln)
-            elif h.added_lines:
-                matched_anchor = False
-                for anchor_ln in h.insertion_anchors:
-                    enc = _enclosing_func_for_line(before_sum.funcs, anchor_ln)
-                    if enc is not None and enc in changed_qualnames:
-                        changed_old_lines.add(anchor_ln)
-                        matched_anchor = True
+            if h.added_lines:
+                changed_old_lines.update(h.insertion_anchors)
                 if (
-                    not matched_anchor
+                    not h.insertion_anchors
                     and not added_methods
                     and not attr_changes
                     and not imports_changed
+                    and h.old_start > 0
                 ):
-                    if h.insertion_anchors:
-                        changed_old_lines.update(h.insertion_anchors)
-                    elif h.old_start > 0:
-                        changed_old_lines.add(h.old_start)
+                    changed_old_lines.add(h.old_start)
 
         expanded_old_lines = _statement_header_lines(before_tree, changed_old_lines)
 

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import concurrent.futures
+import gc
 import hashlib
 import importlib
+import importlib.util
 import json
 import os
 import pickle
@@ -162,24 +164,72 @@ _TPC_EXECUTOR_METHODS: frozenset[str] = frozenset(
 )
 
 MAX_VERIFY_SINGLE_TEST_MS = 8_000
-FORK_CLEAN_CPU_MS = 320
-FORK_PRELOADED_CPU_MS = 85
-PER_FILE_IMPORT_CPU_MS = 85
-BIGQUERY_FILE_IMPORT_CPU_MS = 210
-HEAVY_DEPS_AMORTIZED_CPU_MS = 120
-OPTIMIZER_SETUP_CPU_MS = 240
-EXECUTOR_TPCH_SETUP_CPU_MS = 220
-FAST_TPCDS_CPU_MS = 3_200
+FORK_CLEAN_CPU_MS = 220
+FORK_PRELOADED_CPU_MS = 75
+PER_FILE_IMPORT_CPU_MS = 40
+TINY_FILE_IMPORT_CPU_MS = 8
+BIGQUERY_FILE_IMPORT_CPU_MS = 85
+HEAVY_DEPS_AMORTIZED_CPU_MS = 140
+OPTIMIZER_SETUP_CPU_MS = 80
+EXECUTOR_TPCH_SETUP_CPU_MS = 180
+FAST_TPCDS_CPU_MS = 3_000
 MARGINAL_CPU_RATIO = 0.85
-PRELOADED_MARGINAL_CPU_RATIO = 0.45
+PRELOADED_MARGINAL_CPU_RATIO = 0.55
+OPTIMIZER_MARGINAL_CPU_RATIO = 1.05
 MEMORY_TEST_CPU_RATIO = 0.35
 MEMORY_TEST_THRESHOLD_MS = 5_000
-ROI_RATIO = 1.75
-MIN_NET_GAIN_MS = 800
-PER_COMMIT_EST_CPU_CAP_MS = 10_000
+ROI_RATIO = 1.35
+RESIDUAL_ROI_RATIO = 1.05
+MIN_NET_GAIN_MS = 600
+MIN_RESIDUAL_GAIN_MS = 200
+PER_COMMIT_EST_CPU_CAP_MS = 16_000
 PER_COMMIT_WALL_TIMEOUT_S = 12.0
+FAST_TPCDS_EXTRA_TIMEOUT_S = 6.0
 GLOBAL_WALL_BUDGET_S = 120.0
 MAX_CONCURRENT_CHILDREN = 2
+
+_TINY_TEST_FILES: frozenset[str] = frozenset(
+    {
+        "tests/test_dialect_imports.py",
+        "tests/test_tokens.py",
+        "tests/test_typing.py",
+    }
+)
+
+_PANDAS_HEAVY_METHODS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("tests/test_optimizer.py", "test_canonicalize_internal_names"),
+        ("tests/test_optimizer.py", "test_eliminate_joins"),
+        ("tests/test_optimizer.py", "test_merge_subqueries"),
+        ("tests/test_optimizer.py", "test_optimize"),
+        ("tests/test_optimizer.py", "test_optimize_joins"),
+        ("tests/test_optimizer.py", "test_qualify_columns"),
+        ("tests/test_optimizer.py", "test_simplify"),
+        ("tests/test_optimizer.py", "test_unnest_subqueries"),
+        ("tests/test_executor.py", "test_optimized_tpch"),
+        ("tests/test_executor.py", "test_execute_tpch"),
+        ("tests/test_executor.py", "test_execute_tpcds"),
+        ("tests/test_executor.py", "test_sql_boolean_logic_with_numpy_scalars"),
+    }
+)
+
+
+def _needs_pandas_heavy(
+    test_num: int,
+    file_by_num: Mapping[int, str],
+    id_by_num: Mapping[int, str] | None,
+    *,
+    fast_tpcds_num: int | None = None,
+) -> bool:
+    if fast_tpcds_num is not None and test_num == fast_tpcds_num:
+        return False
+    tfile = file_by_num[test_num]
+    if tfile not in ("tests/test_optimizer.py", "tests/test_executor.py"):
+        return False
+    if id_by_num is None:
+        return True
+    meth = id_by_num[test_num].rsplit("::", 1)[-1]
+    return (tfile, meth) in _PANDAS_HEAVY_METHODS
 
 
 def _preload_stdlib_for_fork() -> None:
@@ -234,6 +284,66 @@ def can_use_preloaded_test_dialect(analysis: CommitAnalysis | None) -> bool:
         ):
             return False
     return True
+
+
+def _loaded_python_files(sqlglot_root: Path) -> frozenset[str]:
+    """Return source files already loaded by this fork server, including registered dialects."""
+    root = os.path.realpath(sqlglot_root)
+    loaded: set[str] = set()
+
+    def add_file(filename: Any) -> None:
+        if not isinstance(filename, str):
+            return
+        if filename.endswith(".pyc"):
+            try:
+                filename = importlib.util.source_from_cache(filename)
+            except ValueError:
+                filename = filename[:-1]
+        if not filename.endswith(".py"):
+            return
+        filename = os.path.realpath(filename)
+        try:
+            if os.path.commonpath((root, filename)) == root:
+                loaded.add(os.path.relpath(filename, root).replace(os.sep, "/"))
+        except ValueError:
+            pass
+
+    for mod in tuple(sys.modules.values()):
+        if mod is not None:
+            add_file(getattr(mod, "__file__", None))
+            spec = getattr(mod, "__spec__", None)
+            add_file(getattr(spec, "origin", None))
+
+    dialect_mod = sys.modules.get("sqlglot.dialects.dialect")
+    dialect = getattr(dialect_mod, "Dialect", None)
+    registry = getattr(dialect, "_classes", {})
+    if isinstance(registry, dict):
+        for cls in tuple(registry.values()):
+            if not isinstance(cls, type):
+                continue
+            for base in cls.__mro__:
+                classes = [base, *(v for v in vars(base).values() if isinstance(v, type))]
+                for value in classes:
+                    name = getattr(value, "__module__", "")
+                    if not isinstance(name, str) or not name.startswith("sqlglot"):
+                        continue
+                    mod = sys.modules.get(name)
+                    if mod is not None:
+                        add_file(getattr(mod, "__file__", None))
+                    else:
+                        # A class can outlive the sys.modules entry that created it.
+                        rel = name.replace(".", "/")
+                        loaded.add(rel + ".py")
+                        loaded.add(rel + "/__init__.py")
+    return frozenset(loaded)
+
+
+def _touches_loaded_file(analysis: CommitAnalysis, loaded: frozenset[str]) -> bool:
+    paths = set(analysis.patched_contents)
+    paths.update(
+        p for fa in analysis.files for p in (fa.rel_path, fa.old_path, fa.new_path) if p
+    )
+    return not paths.isdisjoint(loaded)
 
 
 def can_fast_verify_tpcds(
@@ -394,21 +504,26 @@ def estimate_verify_cpu_ms(
     use_preloaded_sqlglot: bool = False,
     fast_tpcds_num: int | None = None,
     id_by_num: Mapping[int, str] | None = None,
+    imported_files: frozenset[str] | set[str] | None = None,
 ) -> int:
     """Estimate child CPU cost in milliseconds from container profiling measurements."""
     if not test_nums:
         return 0
+    already = imported_files or ()
     overhead = FORK_PRELOADED_CPU_MS if use_preloaded_sqlglot else FORK_CLEAN_CPU_MS
     distinct_files: set[str] = set()
-    has_opt = False
+    has_opt_duckdb = False
+    has_heavy_np_pd = False
     has_exec_tpch = False
     body_ms = 0
     for n in test_nums:
         tfile = file_by_num[n]
         distinct_files.add(tfile)
-        if tfile == "tests/test_optimizer.py":
-            has_opt = True
-        elif tfile == "tests/test_executor.py" and id_by_num is not None:
+        if _needs_pandas_heavy(n, file_by_num, id_by_num, fast_tpcds_num=fast_tpcds_num):
+            has_heavy_np_pd = True
+            if tfile == "tests/test_optimizer.py":
+                has_opt_duckdb = True
+        if tfile == "tests/test_executor.py" and id_by_num is not None:
             meth = id_by_num[n].rsplit("::", 1)[-1]
             if meth in ("test_optimized_tpch", "test_execute_tpch"):
                 has_exec_tpch = True
@@ -416,18 +531,26 @@ def estimate_verify_cpu_ms(
             body_ms += FAST_TPCDS_CPU_MS
         else:
             dur = ms_by_num[n]
-            base_ratio = PRELOADED_MARGINAL_CPU_RATIO if use_preloaded_sqlglot else MARGINAL_CPU_RATIO
-            ratio = MEMORY_TEST_CPU_RATIO if dur >= MEMORY_TEST_THRESHOLD_MS else base_ratio
+            if dur >= MEMORY_TEST_THRESHOLD_MS:
+                ratio = MEMORY_TEST_CPU_RATIO
+            elif tfile == "tests/test_optimizer.py":
+                ratio = OPTIMIZER_MARGINAL_CPU_RATIO
+            else:
+                ratio = PRELOADED_MARGINAL_CPU_RATIO if use_preloaded_sqlglot else MARGINAL_CPU_RATIO
             body_ms += int(dur * ratio)
 
-    overhead += len(distinct_files) * PER_FILE_IMPORT_CPU_MS
-    if "tests/dialects/test_bigquery.py" in distinct_files:
+    new_files = distinct_files - set(already)
+    for tfile in new_files:
+        overhead += TINY_FILE_IMPORT_CPU_MS if tfile in _TINY_TEST_FILES else PER_FILE_IMPORT_CPU_MS
+    if "tests/dialects/test_bigquery.py" in new_files:
         overhead += BIGQUERY_FILE_IMPORT_CPU_MS
-    if has_opt or has_exec_tpch:
+    if has_heavy_np_pd and (
+        "tests/test_optimizer.py" not in already and "tests/test_executor.py" not in already
+    ):
         overhead += HEAVY_DEPS_AMORTIZED_CPU_MS
-    if has_opt:
+    if has_opt_duckdb and "tests/test_optimizer.py" not in already:
         overhead += OPTIMIZER_SETUP_CPU_MS
-    if has_exec_tpch:
+    if has_exec_tpch and "tests/test_executor.py" not in already:
         overhead += EXECUTOR_TPCH_SETUP_CPU_MS
     return overhead + body_ms
 
@@ -470,9 +593,7 @@ def plan_commit_verification(
     if fast_tpcds_ok and id_by_num is not None:
         for t in candidates:
             if id_by_num.get(t) == "tests/test_executor.py::TestExecutor::test_execute_tpcds":
-                other_ms = sum(ms_by_num[n] for n in candidates if n != t)
-                if other_ms <= 4_500:
-                    fast_tpcds_num = t
+                fast_tpcds_num = t
                 break
 
     keep_unverified = frozenset(
@@ -497,14 +618,8 @@ def plan_commit_verification(
         id_by_num=id_by_num,
     )
 
-    distinct_files = {file_by_num[n] for n in to_verify}
-    has_opt = "tests/test_optimizer.py" in distinct_files
-    sum_verify_ms = sum(ms_by_num[n] for n in to_verify)
-    heavy_opt_ok = not (has_opt and sum_verify_ms >= 800 and max_sim_gain_ms < 5_000)
-
     should_verify = (
-        heavy_opt_ok
-        and est_cpu_ms <= PER_COMMIT_EST_CPU_CAP_MS
+        est_cpu_ms <= PER_COMMIT_EST_CPU_CAP_MS
         and max_sim_gain_ms >= int(est_cpu_ms * ROI_RATIO)
         and (max_sim_gain_ms - est_cpu_ms) >= MIN_NET_GAIN_MS
     )
@@ -546,6 +661,12 @@ def create_overlay(
             if entry.name == "__pycache__":
                 if not direct_stems:
                     os.symlink(entry.path, dst_dir / "__pycache__")
+                elif entry.is_dir(follow_symlinks=False):
+                    cache_dst = dst_dir / "__pycache__"
+                    cache_dst.mkdir(parents=True, exist_ok=True)
+                    for pyc in os.scandir(entry.path):
+                        if pyc.name.split(".", 1)[0] not in direct_stems:
+                            os.symlink(pyc.path, cache_dst / pyc.name)
                 continue
             rel = f"{rel_prefix}/{entry.name}" if rel_prefix else entry.name
             dst = dst_dir / entry.name
@@ -772,7 +893,7 @@ def _fast_verify_tpcds(tpcds_plan_hashes: tuple[str, ...], soft_deadline_s: floa
     from tests.test_executor import DIR_TPCDS, open_file
 
     needed_tables = {t for _, _, _, tbls in diff_queries for t in tbls}
-    conn = _duckdb.connect()
+    conn = _duckdb.connect(config={"threads": 1})
     loaded_tables: dict[str, Any] = {}
     try:
         for table_name in sorted(needed_tables):
@@ -929,11 +1050,15 @@ def _install_lazy_heavy_deps() -> None:
         pd_pkg = types.ModuleType("pandas")
         pd_pkg.__path__ = []  # type: ignore[attr-defined]
         pd_pkg.__getattr__ = lambda name: getattr(_activate_pandas(), name)  # type: ignore[attr-defined]
+        def _testing_getattr(name: str) -> Any:
+            if name in ("__path__", "__all__"):
+                raise AttributeError(name)
+            _activate_pandas()
+            return getattr(importlib.import_module("pandas.testing"), name)
+
         testing_mod = types.ModuleType("pandas.testing")
         testing_mod.assert_frame_equal = lazy_assert_frame_equal  # type: ignore[attr-defined]
-        testing_mod.__getattr__ = lambda name: getattr(  # type: ignore[attr-defined]
-            (_activate_pandas(), importlib.import_module("pandas.testing"))[1], name
-        )
+        testing_mod.__getattr__ = _testing_getattr  # type: ignore[attr-defined]
         pd_pkg.testing = testing_mod  # type: ignore[attr-defined]
         stubs["pandas"] = pd_pkg
         stubs["pandas.testing"] = testing_mod
@@ -968,6 +1093,36 @@ def _install_lazy_heavy_deps() -> None:
         sys.meta_path.insert(0, _LazyHeavySubmoduleFinder())  # type: ignore[arg-type]
 
 
+def _remaining_verification_worthwhile(
+    kept: set[int],
+    remaining: set[int],
+    ms_by_num: Mapping[int, int],
+    file_by_num: Mapping[int, str],
+    id_by_num: Mapping[int, str],
+    *,
+    use_preloaded_sqlglot: bool,
+    fast_tpcds_num: int | None,
+    imported_files: set[str] | frozenset[str] | None = None,
+) -> bool:
+    if not kept or not remaining:
+        return True
+    cost_all = compute_commit_cost_ms(schedule_tests(kept | remaining, ms_by_num), ms_by_num)
+    cost_kept = compute_commit_cost_ms(schedule_tests(kept, ms_by_num), ms_by_num)
+    gain = cost_all - cost_kept
+    estimate = estimate_verify_cpu_ms(
+        remaining,
+        ms_by_num,
+        file_by_num,
+        use_preloaded_sqlglot=use_preloaded_sqlglot,
+        fast_tpcds_num=fast_tpcds_num,
+        id_by_num=id_by_num,
+        imported_files=imported_files,
+    )
+    already_paid = FORK_PRELOADED_CPU_MS if use_preloaded_sqlglot else FORK_CLEAN_CPU_MS
+    remaining_estimate = max(0, estimate - already_paid)
+    return gain >= MIN_RESIDUAL_GAIN_MS and gain >= RESIDUAL_ROI_RATIO * remaining_estimate
+
+
 def _run_pytest_fallback(test_id: str) -> bool:
     import pytest
 
@@ -981,11 +1136,18 @@ def _child_execute(
     test_specs: list[tuple[int, str]],
     soft_deadline_s: float,
     *,
+    ms_by_num: Mapping[int, int],
+    keep_unverified: frozenset[int] = frozenset(),
+    use_preloaded_sqlglot: bool = False,
     patched_files: frozenset[str] = frozenset(),
     fast_tpcds: bool = False,
     tpcds_plan_hashes: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Execute candidate tests inside an isolated forked child process."""
+    # The parent may run with collection disabled; freezing the inherited heap first keeps the first
+    # collection from walking (and copy-on-write faulting) every object the parent ever allocated.
+    gc.freeze()
+    gc.enable()
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
     try:
         os.dup2(devnull_fd, 1)
@@ -1014,28 +1176,45 @@ def _child_execute(
         else:
             remaining_specs.append((test_num, test_id))
 
-    if tpcds_spec is not None:
-        try:
-            if _fast_verify_tpcds(tpcds_plan_hashes, soft_deadline_s):
-                passed.append(tpcds_spec[0])
-            else:
-                # Heavy-first gate: if #1106 (21,454ms) fails, abort remaining tests
-                # rather than burning CPU on a commit whose max worker load is already 21.454s.
-                ru_self = resource.getrusage(resource.RUSAGE_SELF)
-                ru_kids = resource.getrusage(resource.RUSAGE_CHILDREN)
-                return {
-                    "passed": [],
-                    "import_error_files": [],
-                    "cpu_s": ru_self.ru_utime + ru_self.ru_stime + ru_kids.ru_utime + ru_kids.ru_stime,
-                }
-        except BaseException:
-            ru_self = resource.getrusage(resource.RUSAGE_SELF)
-            ru_kids = resource.getrusage(resource.RUSAGE_CHILDREN)
-            return {
-                "passed": [],
-                "import_error_files": [],
-                "cpu_s": ru_self.ru_utime + ru_self.ru_stime + ru_kids.ru_utime + ru_kids.ru_stime,
-            }
+    pending = {n for n, _ in test_specs}
+    kept = set(keep_unverified)
+    id_by_num = dict(test_specs)
+    file_by_num = {n: test_id.split("::", 1)[0] for n, test_id in test_specs}
+    tpcds_num = tpcds_spec[0] if tpcds_spec is not None else None
+    imported_files: set[str] = set()
+
+    def should_stop_ordinary() -> bool:
+        ordinary_pending = pending - ({tpcds_num} if tpcds_num is not None else set())
+        if not ordinary_pending:
+            return True
+        if not kept:
+            return False
+        return not _remaining_verification_worthwhile(
+            kept,
+            ordinary_pending,
+            ms_by_num,
+            file_by_num,
+            id_by_num,
+            use_preloaded_sqlglot=use_preloaded_sqlglot,
+            fast_tpcds_num=None,
+            imported_files=imported_files,
+        )
+
+    def should_run_tpcds() -> bool:
+        if tpcds_num is None or tpcds_num not in pending:
+            return False
+        if not kept:
+            return True
+        return _remaining_verification_worthwhile(
+            kept,
+            {tpcds_num},
+            ms_by_num,
+            file_by_num,
+            id_by_num,
+            use_preloaded_sqlglot=use_preloaded_sqlglot,
+            fast_tpcds_num=tpcds_num,
+            imported_files=imported_files,
+        )
 
     by_file_cls: dict[str, dict[str, list[tuple[int, str, str]]]] = {}
     for test_num, test_id in remaining_specs:
@@ -1055,8 +1234,29 @@ def _child_execute(
     )
     can_lazy_optimizer_setup = not test_infra_modified
 
-    for tfile in sorted(by_file_cls):
-        if time.monotonic() >= soft_deadline_s:
+    # Run golden-hash TPC-DS verification FIRST (before importing any ordinary test file):
+    # (1) zero state leakage from ordinary tests into _fast_verify_tpcds;
+    # (2) #1106 (21.454s) is the highest-ROI candidate (~7x) and gets full wall-clock headroom;
+    # (3) if #1106 fails, kept={1106} lets fail-aware early exit skip unworthwhile ordinary tests.
+    if tpcds_spec is not None and should_run_tpcds() and time.monotonic() < soft_deadline_s:
+        tpcds_ok = False
+        try:
+            tpcds_ok = _fast_verify_tpcds(tpcds_plan_hashes, soft_deadline_s)
+        except BaseException:
+            tpcds_ok = False
+        pending.discard(tpcds_spec[0])
+        if tpcds_ok:
+            passed.append(tpcds_spec[0])
+        else:
+            kept.add(tpcds_spec[0])
+
+    stop = should_stop_ordinary()
+    ordered_files = sorted(
+        by_file_cls,
+        key=lambda f: (min(ms_by_num[n] for group in by_file_cls[f].values() for n, _, _ in group), f),
+    )
+    for tfile in ordered_files:
+        if stop or time.monotonic() >= soft_deadline_s:
             break
         if (
             tfile in ("tests/test_optimizer.py", "tests/test_executor.py")
@@ -1069,22 +1269,36 @@ def _child_execute(
             mod = importlib.import_module(mod_name)
         except BaseException:
             import_error_files.append(tfile)
+            failed_file = {n for group in by_file_cls[tfile].values() for n, _, _ in group}
+            kept.update(failed_file)
+            pending.difference_update(failed_file)
+            stop = should_stop_ordinary()
             continue
+        imported_files.add(tfile)
 
         for cls_name in sorted(by_file_cls[tfile]):
-            if time.monotonic() >= soft_deadline_s:
+            if stop or time.monotonic() >= soft_deadline_s:
                 break
-            methods = by_file_cls[tfile][cls_name]
+            methods = sorted(by_file_cls[tfile][cls_name], key=lambda item: (ms_by_num[item[0]], item[0]))
             cls = getattr(mod, cls_name, None) if cls_name else None
             if cls is None or not isinstance(cls, type) or not issubclass(cls, unittest.TestCase):
                 for test_num, _meth, test_id in methods:
                     if time.monotonic() >= soft_deadline_s:
                         break
                     try:
-                        if _run_pytest_fallback(test_id):
-                            passed.append(test_num)
+                        ok = _run_pytest_fallback(test_id)
                     except BaseException:
-                        pass
+                        ok = False
+                    pending.discard(test_num)
+                    if ok:
+                        passed.append(test_num)
+                    else:
+                        kept.add(test_num)
+                    if should_stop_ordinary():
+                        stop = True
+                        break
+                if stop:
+                    break
                 continue
 
             run_setup_class = True
@@ -1147,13 +1361,27 @@ def _child_execute(
                     mod.TPCDS_SCHEMA = orig_tpcds_schema
                 if orig_tpch_schema is not None:
                     mod.TPCH_SCHEMA = orig_tpch_schema
+                failed_class = {n for n, _, _ in methods}
+                kept.update(failed_class)
+                pending.difference_update(failed_class)
+                stop = should_stop_ordinary()
+                if stop:
+                    break
                 continue
 
             cls_passed: list[int] = []
             teardown_failed = False
             try:
                 for test_num, meth_name, _test_id in methods:
-                    if time.monotonic() >= soft_deadline_s:
+                    now_t = time.monotonic()
+                    if now_t >= soft_deadline_s:
+                        break
+                    if (
+                        (passed or cls_passed)
+                        and ms_by_num[test_num] >= 500
+                        and now_t + (ms_by_num[test_num] / 1000.0) * 1.5 >= soft_deadline_s
+                    ):
+                        stop = True
                         break
                     res = _FailFastResult()
                     try:
@@ -1163,8 +1391,14 @@ def _child_execute(
                         res.failed = True
                     except BaseException:
                         res.failed = True
+                    pending.discard(test_num)
                     if not res.failed:
                         cls_passed.append(test_num)
+                    else:
+                        kept.add(test_num)
+                    if should_stop_ordinary():
+                        stop = True
+                        break
             finally:
                 if orig_tpcds_schema is not None:
                     mod.TPCDS_SCHEMA = orig_tpcds_schema
@@ -1185,6 +1419,11 @@ def _child_execute(
                         teardown_failed = True
             if not teardown_failed:
                 passed.extend(cls_passed)
+            else:
+                kept.update(cls_passed)
+                stop = should_stop_ordinary()
+            if stop:
+                break
 
     ru_self = resource.getrusage(resource.RUSAGE_SELF)
     ru_kids = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -1236,6 +1475,7 @@ def _run_fork_queue(
     batch_deadline: float,
     concurrency: int,
     tmp_base: str,
+    ms_by_num: Mapping[int, int],
 ) -> None:
     if not queue:
         return
@@ -1254,7 +1494,10 @@ def _run_fork_queue(
             cid, analysis, cands, plan = queue[q_idx]
             q_idx += 1
 
-            timeout_s = min(per_commit_timeout_s, remaining_batch - 0.5)
+            commit_cap = per_commit_timeout_s + (
+                FAST_TPCDS_EXTRA_TIMEOUT_S if plan.fast_tpcds else 0.0
+            )
+            timeout_s = min(commit_cap, remaining_batch - 0.5)
             overlay_dir = create_overlay(sqlglot_root, analysis.patched_contents, tmp_base=tmp_base)
             test_specs = [(n, id_by_num[n]) for n in sorted(plan.to_verify)]
             patched_files = frozenset(
@@ -1278,6 +1521,9 @@ def _run_fork_queue(
                         overlay_dir,
                         test_specs,
                         soft_deadline,
+                        ms_by_num=ms_by_num,
+                        keep_unverified=plan.keep_unverified,
+                        use_preloaded_sqlglot=plan.use_preloaded_sqlglot,
                         patched_files=patched_files,
                         fast_tpcds=plan.fast_tpcds,
                         tpcds_plan_hashes=tpcds_plan_hashes,
@@ -1509,6 +1755,7 @@ def verify_batch(
             batch_deadline,
             concurrency,
             tmp_base,
+            ms_by_num,
         )
 
     # Tier 2: Isolated sqlglot-preloaded fork server (keeps main parent 100% free of sqlglot)
@@ -1530,27 +1777,98 @@ def verify_batch(
                     sys.path.insert(0, root_str)
                 os.environ["SKIP_INTEGRATION"] = "0"
                 importlib.import_module("sqlglot")
+                gc.freeze()
+                loaded_sqlglot = _loaded_python_files(sqlglot_root)
 
-                tier2a = []
-                tier2b_light = []
-                tier2b_heavy = []
+                def _has_heavy_test(plan_obj: VerifyPlan) -> bool:
+                    tpcds_id = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+                    tpcds_n = (
+                        next((n for n in plan_obj.to_verify if id_by_num.get(n) == tpcds_id), None)
+                        if plan_obj.fast_tpcds
+                        else None
+                    )
+                    return any(
+                        _needs_pandas_heavy(n, file_by_num, id_by_num, fast_tpcds_num=tpcds_n)
+                        for n in plan_obj.to_verify
+                    )
+
+                def _has_dialect_test(plan_obj: VerifyPlan) -> bool:
+                    return any(
+                        file_by_num[n].startswith("tests/dialects/")
+                        for n in plan_obj.to_verify
+                    )
+
+                def _run_with_optional_test_dialect(
+                    items: list[tuple[str, CommitAnalysis, frozenset[int], VerifyPlan]],
+                    out_map: dict[str, VerifyOutcome],
+                    bounce_ids: list[str],
+                    *,
+                    min_dialect_commits: int = 2,
+                ) -> None:
+                    if not items:
+                        return
+                    dialect_commits = sum(
+                        1 for item in items if not item[3].fast_tpcds and _has_dialect_test(item[3])
+                    )
+                    if dialect_commits >= min_dialect_commits:
+                        try:
+                            importlib.import_module("tests.dialects.test_dialect")
+                        except BaseException:
+                            pass
+                        gc.freeze()
+                        loaded_td = _loaded_python_files(sqlglot_root)
+                        safe_items = []
+                        for item in items:
+                            if _touches_loaded_file(item[1], loaded_td):
+                                bounce_ids.append(item[0])
+                            else:
+                                safe_items.append(item)
+                        items = safe_items
+                    if items:
+                        _run_fork_queue(
+                            items,
+                            out_map,
+                            sqlglot_root,
+                            id_by_num,
+                            file_to_tests,
+                            tpcds_plan_hashes,
+                            per_commit_timeout_s,
+                            batch_deadline,
+                            concurrency,
+                            tmp_base,
+                            ms_by_num,
+                        )
+
+                t2_light_no_td = []
+                t2_light_td = []
+                t2_heavy_no_td = []
+                t2_heavy_td = []
+                needs_clean: list[str] = []
                 for item in tier2_queue:
                     an = item[1]
                     plan = item[3]
-                    if not can_use_preloaded_test_dialect(an):
-                        tier2a.append(item)
-                    elif any(
-                        file_by_num[n] in ("tests/test_optimizer.py", "tests/test_executor.py")
-                        for n in plan.to_verify
-                    ):
-                        tier2b_heavy.append(item)
+                    if _touches_loaded_file(an, loaded_sqlglot):
+                        needs_clean.append(item[0])
+                    elif _has_heavy_test(plan):
+                        if can_use_preloaded_test_dialect(an):
+                            t2_heavy_td.append(item)
+                        else:
+                            t2_heavy_no_td.append(item)
+                    elif can_use_preloaded_test_dialect(an):
+                        t2_light_td.append(item)
                     else:
-                        tier2b_light.append(item)
+                        t2_light_no_td.append(item)
 
                 t2_outcomes: dict[str, VerifyOutcome] = {}
-                if tier2a:
+                if len(t2_heavy_no_td) + len(t2_heavy_td) == 1:
+                    t2_light_no_td.extend(t2_heavy_no_td)
+                    t2_light_td.extend(t2_heavy_td)
+                    t2_heavy_no_td = []
+                    t2_heavy_td = []
+
+                if t2_light_no_td:
                     _run_fork_queue(
-                        tier2a,
+                        t2_light_no_td,
                         t2_outcomes,
                         sqlglot_root,
                         id_by_num,
@@ -1560,26 +1878,105 @@ def verify_batch(
                         batch_deadline,
                         concurrency,
                         tmp_base,
+                        ms_by_num,
                     )
-                tier2b = [*tier2b_light, *tier2b_heavy]
-                if len(tier2b) >= 2:
-                    try:
-                        importlib.import_module("tests.dialects.test_dialect")
-                    except BaseException:
-                        pass
-                if tier2b:
-                    _run_fork_queue(
-                        tier2b,
-                        t2_outcomes,
-                        sqlglot_root,
-                        id_by_num,
-                        file_to_tests,
-                        tpcds_plan_hashes,
-                        per_commit_timeout_s,
-                        batch_deadline,
-                        concurrency,
-                        tmp_base,
-                    )
+
+                # Fork a heavy sub-master when >= 2 Tier-2 commits verify optimizer/executor tests,
+                # sharing a single numpy+pandas preload without polluting light Tier-2 children.
+                if t2_heavy_no_td or t2_heavy_td:
+                    hr_fd, hw_fd = os.pipe()
+                    h_pid = os.fork()
+                    if h_pid == 0:
+                        os.close(hr_fd)
+                        try:
+                            try:
+                                importlib.import_module("numpy")
+                                importlib.import_module("pandas")
+                                importlib.import_module("pandas.testing")
+                            except BaseException:
+                                pass
+                            gc.freeze()
+                            loaded_heavy = _loaded_python_files(sqlglot_root)
+                            h_bounce: list[str] = []
+                            safe_h_no_td = []
+                            for item in t2_heavy_no_td:
+                                if _touches_loaded_file(item[1], loaded_heavy):
+                                    h_bounce.append(item[0])
+                                else:
+                                    safe_h_no_td.append(item)
+                            safe_h_td = []
+                            for item in t2_heavy_td:
+                                if _touches_loaded_file(item[1], loaded_heavy):
+                                    h_bounce.append(item[0])
+                                else:
+                                    safe_h_td.append(item)
+                            h_outcomes: dict[str, VerifyOutcome] = {}
+                            if safe_h_no_td:
+                                _run_fork_queue(
+                                    safe_h_no_td,
+                                    h_outcomes,
+                                    sqlglot_root,
+                                    id_by_num,
+                                    file_to_tests,
+                                    tpcds_plan_hashes,
+                                    per_commit_timeout_s,
+                                    batch_deadline,
+                                    concurrency,
+                                    tmp_base,
+                                    ms_by_num,
+                                )
+                            _run_with_optional_test_dialect(safe_h_td, h_outcomes, h_bounce)
+                            h_serial = {
+                                cid: {
+                                    "final_tests": sorted(o.final_tests),
+                                    "verified": o.verified,
+                                    "shed_count": o.shed_count,
+                                    "child_cpu_s": o.child_cpu_s,
+                                    "wall_s": o.wall_s,
+                                    "timed_out": o.timed_out,
+                                }
+                                for cid, o in h_outcomes.items()
+                            }
+                            h_raw = json.dumps(
+                                {"outcomes": h_serial, "needs_clean": h_bounce},
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                            h_view = memoryview(h_raw)
+                            h_written = 0
+                            while h_written < len(h_view):
+                                h_written += os.write(hw_fd, h_view[h_written:])
+                        except BaseException:
+                            pass
+                        finally:
+                            os.close(hw_fd)
+                            os._exit(0)
+                    else:
+                        os.close(hw_fd)
+                        h_buf = bytearray()
+                        while True:
+                            chunk = os.read(hr_fd, 65536)
+                            if not chunk:
+                                break
+                            h_buf.extend(chunk)
+                        os.close(hr_fd)
+                        _reap_child(h_pid)
+                        if h_buf:
+                            try:
+                                h_data = json.loads(h_buf.decode("utf-8"))
+                                for cid, entry in h_data["outcomes"].items():
+                                    t2_outcomes[cid] = VerifyOutcome(
+                                        final_tests=frozenset(entry["final_tests"]),
+                                        verified=bool(entry["verified"]),
+                                        shed_count=int(entry["shed_count"]),
+                                        child_cpu_s=float(entry["child_cpu_s"]),
+                                        wall_s=float(entry["wall_s"]),
+                                        timed_out=bool(entry["timed_out"]),
+                                    )
+                                needs_clean.extend(h_data["needs_clean"])
+                            except (UnicodeDecodeError, ValueError, KeyError, TypeError):
+                                pass
+
+                _run_with_optional_test_dialect(t2_light_td, t2_outcomes, needs_clean)
                 serial = {
                     cid: {
                         "final_tests": sorted(o.final_tests),
@@ -1591,7 +1988,9 @@ def verify_batch(
                     }
                     for cid, o in t2_outcomes.items()
                 }
-                raw = json.dumps(serial, separators=(",", ":")).encode("utf-8")
+                raw = json.dumps(
+                    {"outcomes": serial, "needs_clean": needs_clean}, separators=(",", ":")
+                ).encode("utf-8")
                 view = memoryview(raw)
                 written = 0
                 while written < len(view):
@@ -1612,16 +2011,34 @@ def verify_batch(
             os.close(r_fd)
             _reap_child(t2_pid)
             if buf:
-                t2_data = json.loads(buf.decode("utf-8"))
-                for cid, entry in t2_data.items():
-                    outcomes[cid] = VerifyOutcome(
-                        final_tests=frozenset(entry["final_tests"]),
-                        verified=bool(entry["verified"]),
-                        shed_count=int(entry["shed_count"]),
-                        child_cpu_s=float(entry["child_cpu_s"]),
-                        wall_s=float(entry["wall_s"]),
-                        timed_out=bool(entry["timed_out"]),
+                try:
+                    t2_data = json.loads(buf.decode("utf-8"))
+                    for cid, entry in t2_data["outcomes"].items():
+                        outcomes[cid] = VerifyOutcome(
+                            final_tests=frozenset(entry["final_tests"]),
+                            verified=bool(entry["verified"]),
+                            shed_count=int(entry["shed_count"]),
+                            child_cpu_s=float(entry["child_cpu_s"]),
+                            wall_s=float(entry["wall_s"]),
+                            timed_out=bool(entry["timed_out"]),
+                        )
+                    needs_clean = frozenset(t2_data["needs_clean"])
+                    clean_queue = [item for item in tier2_queue if item[0] in needs_clean]
+                    _run_fork_queue(
+                        clean_queue,
+                        outcomes,
+                        sqlglot_root,
+                        id_by_num,
+                        file_to_tests,
+                        tpcds_plan_hashes,
+                        per_commit_timeout_s,
+                        batch_deadline,
+                        concurrency,
+                        tmp_base,
+                        ms_by_num,
                     )
+                except (UnicodeDecodeError, ValueError, KeyError, TypeError):
+                    pass
             for cid, _an, cands, _plan in tier2_queue:
                 if cid not in outcomes:
                     outcomes[cid] = VerifyOutcome(
