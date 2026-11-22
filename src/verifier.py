@@ -163,29 +163,41 @@ _TPC_EXECUTOR_METHODS: frozenset[str] = frozenset(
     }
 )
 
+_TEST_MAX_NODES_ID = "tests/test_parser.py::TestParser::test_max_nodes"
+_TEST_EXECUTE_TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+_DEFERRED_HEAVY_IDS: frozenset[str] = frozenset({_TEST_MAX_NODES_ID, _TEST_EXECUTE_TPCDS_ID})
+
 MAX_VERIFY_SINGLE_TEST_MS = 8_000
-FORK_CLEAN_CPU_MS = 220
-FORK_PRELOADED_CPU_MS = 75
-PER_FILE_IMPORT_CPU_MS = 40
-TINY_FILE_IMPORT_CPU_MS = 8
-BIGQUERY_FILE_IMPORT_CPU_MS = 85
-HEAVY_DEPS_AMORTIZED_CPU_MS = 140
-OPTIMIZER_SETUP_CPU_MS = 80
-EXECUTOR_TPCH_SETUP_CPU_MS = 180
-FAST_TPCDS_CPU_MS = 3_000
-MARGINAL_CPU_RATIO = 0.85
-PRELOADED_MARGINAL_CPU_RATIO = 0.55
-OPTIMIZER_MARGINAL_CPU_RATIO = 1.05
-MEMORY_TEST_CPU_RATIO = 0.35
+DEFERRED_HEAVY_MAX_NODES_CPU_MS = 14_000
+DEFERRED_HEAVY_TPCDS_CPU_MS = 15_000
+DEFERRED_HEAVY_WALL_TIMEOUT_S = 38.0
+DEFERRED_HEAVY_MIN_BATCH_HEADROOM_S = 45.0
+DEFERRED_HEAVY_MAX_KEPT_TESTS = 5
+DEFERRED_HEAVY_MAX_KEPT_TEST_MS = 2_500
+HEAVY_OUTLIER_MIN_MS = 1_000
+
+FORK_CLEAN_CPU_MS = 120
+FORK_PRELOADED_CPU_MS = 40
+PER_FILE_IMPORT_CPU_MS = 22
+TINY_FILE_IMPORT_CPU_MS = 5
+BIGQUERY_FILE_IMPORT_CPU_MS = 50
+HEAVY_DEPS_AMORTIZED_CPU_MS = 80
+OPTIMIZER_SETUP_CPU_MS = 45
+EXECUTOR_TPCH_SETUP_CPU_MS = 100
+FAST_TPCDS_CPU_MS = 1_500
+MARGINAL_CPU_RATIO = 0.45
+PRELOADED_MARGINAL_CPU_RATIO = 0.30
+OPTIMIZER_MARGINAL_CPU_RATIO = 0.60
+MEMORY_TEST_CPU_RATIO = 0.25
 MEMORY_TEST_THRESHOLD_MS = 5_000
-ROI_RATIO = 1.35
-RESIDUAL_ROI_RATIO = 1.05
-MIN_NET_GAIN_MS = 600
-MIN_RESIDUAL_GAIN_MS = 200
-PER_COMMIT_EST_CPU_CAP_MS = 16_000
-PER_COMMIT_WALL_TIMEOUT_S = 12.0
+ROI_RATIO = 1.10
+RESIDUAL_ROI_RATIO = 1.00
+MIN_NET_GAIN_MS = 250
+MIN_RESIDUAL_GAIN_MS = 150
+PER_COMMIT_EST_CPU_CAP_MS = 40_000
+PER_COMMIT_WALL_TIMEOUT_S = 22.0
 FAST_TPCDS_EXTRA_TIMEOUT_S = 6.0
-GLOBAL_WALL_BUDGET_S = 120.0
+GLOBAL_WALL_BUDGET_S = 145.0
 MAX_CONCURRENT_CHILDREN = 2
 
 _TINY_TEST_FILES: frozenset[str] = frozenset(
@@ -484,6 +496,7 @@ class VerifyPlan:
     should_verify: bool
     use_preloaded_sqlglot: bool = False
     fast_tpcds: bool = False
+    deferred_heavy: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -494,6 +507,22 @@ class VerifyOutcome:
     child_cpu_s: float
     wall_s: float
     timed_out: bool = False
+
+
+def _deferred_heavy_cpu_ms(test_num: int, id_by_num: Mapping[int, str] | None) -> int:
+    if id_by_num is not None and id_by_num.get(test_num) == _TEST_MAX_NODES_ID:
+        return DEFERRED_HEAVY_MAX_NODES_CPU_MS
+    return DEFERRED_HEAVY_TPCDS_CPU_MS
+
+
+def _is_deferred_heavy_eligible(
+    test_num: int,
+    ms_by_num: Mapping[int, int],
+    id_by_num: Mapping[int, str] | None,
+) -> bool:
+    if ms_by_num[test_num] <= MAX_VERIFY_SINGLE_TEST_MS or id_by_num is None:
+        return False
+    return id_by_num.get(test_num) in _DEFERRED_HEAVY_IDS
 
 
 def estimate_verify_cpu_ms(
@@ -529,6 +558,8 @@ def estimate_verify_cpu_ms(
                 has_exec_tpch = True
         if fast_tpcds_num is not None and n == fast_tpcds_num:
             body_ms += FAST_TPCDS_CPU_MS
+        elif _is_deferred_heavy_eligible(n, ms_by_num, id_by_num):
+            body_ms += _deferred_heavy_cpu_ms(n, id_by_num)
         else:
             dur = ms_by_num[n]
             if dur >= MEMORY_TEST_THRESHOLD_MS:
@@ -569,7 +600,7 @@ def plan_commit_verification(
     tpcds_exec_qualnames: Mapping[str, frozenset[str]] | None = None,
     import_time_qualnames: Mapping[str, frozenset[str]] | None = None,
 ) -> VerifyPlan:
-    """Decide whether verifying eligible candidates has positive expected ROI."""
+    """Decide whether verifying eligible candidates (or a heavy-outlier subset) has positive ROI."""
     if not candidates:
         return VerifyPlan(frozenset(), frozenset(), 0, 0, False)
 
@@ -592,46 +623,104 @@ def plan_commit_verification(
     fast_tpcds_num: int | None = None
     if fast_tpcds_ok and id_by_num is not None:
         for t in candidates:
-            if id_by_num.get(t) == "tests/test_executor.py::TestExecutor::test_execute_tpcds":
+            if id_by_num.get(t) == _TEST_EXECUTE_TPCDS_ID:
                 fast_tpcds_num = t
                 break
 
-    keep_unverified = frozenset(
-        t
-        for t in candidates
-        if t in direct_fixture_tests
-        or (ms_by_num[t] > MAX_VERIFY_SINGLE_TEST_MS and t != fast_tpcds_num)
-    )
-    to_verify = candidates - keep_unverified
-    if not to_verify:
-        return VerifyPlan(keep_unverified, frozenset(), 0, 0, False, use_preloaded, False)
+    hard_keep: set[int] = set()
+    deferred_all_set: set[int] = set()
+    for t in candidates:
+        if t in direct_fixture_tests:
+            hard_keep.add(t)
+        elif ms_by_num[t] > MAX_VERIFY_SINGLE_TEST_MS and t != fast_tpcds_num:
+            if _is_deferred_heavy_eligible(t, ms_by_num, id_by_num):
+                deferred_all_set.add(t)
+            else:
+                hard_keep.add(t)
+
+    deferred_all = frozenset(deferred_all_set)
+    ordinary_all = candidates - hard_keep - deferred_all
+    if not ordinary_all and not deferred_all:
+        return VerifyPlan(frozenset(hard_keep), frozenset(), 0, 0, False, use_preloaded, False)
 
     cost_all = compute_commit_cost_ms(schedule_tests(candidates, ms_by_num), ms_by_num)
-    cost_kept = compute_commit_cost_ms(schedule_tests(keep_unverified, ms_by_num), ms_by_num)
-    max_sim_gain_ms = cost_all - cost_kept
-    est_cpu_ms = estimate_verify_cpu_ms(
-        to_verify,
-        ms_by_num,
-        file_by_num,
-        use_preloaded_sqlglot=use_preloaded,
-        fast_tpcds_num=fast_tpcds_num,
-        id_by_num=id_by_num,
-    )
 
-    should_verify = (
-        est_cpu_ms <= PER_COMMIT_EST_CPU_CAP_MS
-        and max_sim_gain_ms >= int(est_cpu_ms * ROI_RATIO)
-        and (max_sim_gain_ms - est_cpu_ms) >= MIN_NET_GAIN_MS
+    def eval_plan(verify_ord: frozenset[int], verify_def: frozenset[int]) -> VerifyPlan:
+        to_verify = verify_ord | verify_def
+        keep_unverified = candidates - to_verify
+        if not to_verify:
+            return VerifyPlan(keep_unverified, frozenset(), 0, 0, False, use_preloaded, False)
+        cost_kept = compute_commit_cost_ms(schedule_tests(keep_unverified, ms_by_num), ms_by_num)
+        max_sim_gain_ms = cost_all - cost_kept
+        plan_fast_tpcds = fast_tpcds_num if fast_tpcds_num in verify_ord else None
+        est_cpu_ms = estimate_verify_cpu_ms(
+            to_verify,
+            ms_by_num,
+            file_by_num,
+            use_preloaded_sqlglot=use_preloaded,
+            fast_tpcds_num=plan_fast_tpcds,
+            id_by_num=id_by_num,
+        )
+        should_verify = (
+            est_cpu_ms <= PER_COMMIT_EST_CPU_CAP_MS
+            and max_sim_gain_ms >= int(est_cpu_ms * ROI_RATIO)
+            and (max_sim_gain_ms - est_cpu_ms) >= MIN_NET_GAIN_MS
+        )
+        return VerifyPlan(
+            keep_unverified=keep_unverified,
+            to_verify=to_verify,
+            est_cpu_ms=est_cpu_ms,
+            max_sim_gain_ms=max_sim_gain_ms,
+            should_verify=should_verify,
+            use_preloaded_sqlglot=use_preloaded,
+            fast_tpcds=plan_fast_tpcds is not None,
+            deferred_heavy=verify_def,
+        )
+
+    deferred_list = sorted(deferred_all)
+    deferred_subsets: list[frozenset[int]] = [frozenset()]
+    for d in deferred_list:
+        deferred_subsets.extend(sub | {d} for sub in list(deferred_subsets))
+
+    ordinary_subsets: list[frozenset[int]] = [ordinary_all]
+    heavy_1k = frozenset(
+        t for t in ordinary_all if t == fast_tpcds_num or ms_by_num[t] >= HEAVY_OUTLIER_MIN_MS
     )
-    return VerifyPlan(
-        keep_unverified=keep_unverified,
-        to_verify=to_verify,
-        est_cpu_ms=est_cpu_ms,
-        max_sim_gain_ms=max_sim_gain_ms,
-        should_verify=should_verify,
-        use_preloaded_sqlglot=use_preloaded,
-        fast_tpcds=fast_tpcds_num is not None,
+    heavy_2k = frozenset(
+        t for t in ordinary_all if t == fast_tpcds_num or ms_by_num[t] >= 2_000
     )
+    fast_only = frozenset({fast_tpcds_num}) if fast_tpcds_num is not None else frozenset()
+    for sub in (heavy_1k, heavy_2k, fast_only, frozenset()):
+        if sub not in ordinary_subsets:
+            ordinary_subsets.append(sub)
+
+    full_plan = eval_plan(ordinary_all, deferred_all)
+    best_plan: VerifyPlan | None = full_plan if full_plan.should_verify else None
+
+    for ord_sub in ordinary_subsets:
+        for def_sub in deferred_subsets:
+            if not ord_sub and not def_sub:
+                continue
+            cand_plan = eval_plan(ord_sub, def_sub)
+            if not cand_plan.should_verify:
+                continue
+            if best_plan is None:
+                best_plan = cand_plan
+                continue
+            cand_key = (
+                cand_plan.max_sim_gain_ms - cand_plan.est_cpu_ms,
+                len(cand_plan.to_verify),
+                -cand_plan.est_cpu_ms,
+            )
+            best_key = (
+                best_plan.max_sim_gain_ms - best_plan.est_cpu_ms,
+                len(best_plan.to_verify),
+                -best_plan.est_cpu_ms,
+            )
+            if cand_key > best_key:
+                best_plan = cand_plan
+
+    return best_plan if best_plan is not None else full_plan
 
 
 def create_overlay(
@@ -1142,6 +1231,10 @@ def _child_execute(
     patched_files: frozenset[str] = frozenset(),
     fast_tpcds: bool = False,
     tpcds_plan_hashes: tuple[str, ...] = (),
+    deferred_heavy: frozenset[int] = frozenset(),
+    batch_deadline: float = float("inf"),
+    deferred_heavy_min_headroom_s: float = DEFERRED_HEAVY_MIN_BATCH_HEADROOM_S,
+    checkpoint_fd: int | None = None,
 ) -> dict[str, Any]:
     """Execute candidate tests inside an isolated forked child process."""
     # The parent may run with collection disabled; freezing the inherited heap first keeps the first
@@ -1164,33 +1257,69 @@ def _child_execute(
     passed: list[int] = []
     import_error_files: list[str] = []
 
+    def emit_checkpoint() -> None:
+        if checkpoint_fd is None:
+            return
+        ru_s = resource.getrusage(resource.RUSAGE_SELF)
+        ru_k = resource.getrusage(resource.RUSAGE_CHILDREN)
+        snap = {
+            "passed": sorted(passed),
+            "import_error_files": sorted(set(import_error_files)),
+            "cpu_s": ru_s.ru_utime + ru_s.ru_stime + ru_k.ru_utime + ru_k.ru_stime,
+        }
+        raw_line = (json.dumps(snap, separators=(",", ":")) + "\n").encode("utf-8")
+        view = memoryview(raw_line)
+        written = 0
+        while written < len(view):
+            written += os.write(checkpoint_fd, view[written:])
+
     remaining_specs: list[tuple[int, str]] = []
+    deferred_specs: list[tuple[int, str]] = []
     tpcds_spec: tuple[int, str] | None = None
     for test_num, test_id in test_specs:
-        if (
-            fast_tpcds
-            and tpcds_plan_hashes
-            and test_id == "tests/test_executor.py::TestExecutor::test_execute_tpcds"
-        ):
+        if fast_tpcds and tpcds_plan_hashes and test_id == _TEST_EXECUTE_TPCDS_ID:
             tpcds_spec = (test_num, test_id)
+        elif test_num in deferred_heavy:
+            deferred_specs.append((test_num, test_id))
         else:
             remaining_specs.append((test_num, test_id))
 
+    deferred_specs.sort(key=lambda item: (-ms_by_num[item[0]], item[0]))
+    deferred_nums = {n for n, _ in deferred_specs}
     pending = {n for n, _ in test_specs}
     kept = set(keep_unverified)
+    actual_failures: set[int] = set()
     id_by_num = dict(test_specs)
     file_by_num = {n: test_id.split("::", 1)[0] for n, test_id in test_specs}
     tpcds_num = tpcds_spec[0] if tpcds_spec is not None else None
     imported_files: set[str] = set()
+    heavy_only = False
+
+    def disqualified_deferred() -> set[int]:
+        if not deferred_nums:
+            return set()
+        if import_error_files or (
+            actual_failures
+            and (
+                len(actual_failures) > DEFERRED_HEAVY_MAX_KEPT_TESTS
+                or max(ms_by_num[t] for t in actual_failures) > DEFERRED_HEAVY_MAX_KEPT_TEST_MS
+            )
+        ):
+            return set(deferred_nums)
+        if any(file_by_num.get(t) == "tests/test_executor.py" for t in actual_failures):
+            return {n for n in deferred_nums if id_by_num.get(n) == _TEST_EXECUTE_TPCDS_ID}
+        return set()
 
     def should_stop_ordinary() -> bool:
-        ordinary_pending = pending - ({tpcds_num} if tpcds_num is not None else set())
+        nonlocal heavy_only
+        ordinary_pending = pending - deferred_nums - ({tpcds_num} if tpcds_num is not None else set())
         if not ordinary_pending:
             return True
-        if not kept:
+        eff_kept = kept | disqualified_deferred()
+        if not eff_kept:
             return False
-        return not _remaining_verification_worthwhile(
-            kept,
+        if _remaining_verification_worthwhile(
+            eff_kept,
             ordinary_pending,
             ms_by_num,
             file_by_num,
@@ -1198,7 +1327,26 @@ def _child_execute(
             use_preloaded_sqlglot=use_preloaded_sqlglot,
             fast_tpcds_num=None,
             imported_files=imported_files,
-        )
+        ):
+            return False
+        if not heavy_only:
+            heavy_pending = {t for t in ordinary_pending if ms_by_num[t] >= HEAVY_OUTLIER_MIN_MS}
+            cheap_pending = ordinary_pending - heavy_pending
+            if heavy_pending and cheap_pending and _remaining_verification_worthwhile(
+                eff_kept | cheap_pending,
+                heavy_pending,
+                ms_by_num,
+                file_by_num,
+                id_by_num,
+                use_preloaded_sqlglot=use_preloaded_sqlglot,
+                fast_tpcds_num=None,
+                imported_files=imported_files,
+            ):
+                kept.update(cheap_pending)
+                pending.difference_update(cheap_pending)
+                heavy_only = True
+                return False
+        return True
 
     def should_run_tpcds() -> bool:
         if tpcds_num is None or tpcds_num not in pending:
@@ -1234,10 +1382,8 @@ def _child_execute(
     )
     can_lazy_optimizer_setup = not test_infra_modified
 
-    # Run golden-hash TPC-DS verification FIRST (before importing any ordinary test file):
-    # (1) zero state leakage from ordinary tests into _fast_verify_tpcds;
-    # (2) #1106 (21.454s) is the highest-ROI candidate (~7x) and gets full wall-clock headroom;
-    # (3) if #1106 fails, kept={1106} lets fail-aware early exit skip unworthwhile ordinary tests.
+    # Run golden-hash TPC-DS verification first so #1106 gets clean state and full headroom;
+    # if it fails, kept={1106} lets fail-aware early exit skip unworthwhile ordinary tests.
     if tpcds_spec is not None and should_run_tpcds() and time.monotonic() < soft_deadline_s:
         tpcds_ok = False
         try:
@@ -1247,8 +1393,10 @@ def _child_execute(
         pending.discard(tpcds_spec[0])
         if tpcds_ok:
             passed.append(tpcds_spec[0])
+            emit_checkpoint()
         else:
             kept.add(tpcds_spec[0])
+            actual_failures.add(tpcds_spec[0])
 
     stop = should_stop_ordinary()
     ordered_files = sorted(
@@ -1258,6 +1406,8 @@ def _child_execute(
     for tfile in ordered_files:
         if stop or time.monotonic() >= soft_deadline_s:
             break
+        if not any(n in pending for group in by_file_cls[tfile].values() for n, _, _ in group):
+            continue
         if (
             tfile in ("tests/test_optimizer.py", "tests/test_executor.py")
             and can_lazy_optimizer_setup
@@ -1271,6 +1421,7 @@ def _child_execute(
             import_error_files.append(tfile)
             failed_file = {n for group in by_file_cls[tfile].values() for n, _, _ in group}
             kept.update(failed_file)
+            actual_failures.update(failed_file)
             pending.difference_update(failed_file)
             stop = should_stop_ordinary()
             continue
@@ -1279,10 +1430,17 @@ def _child_execute(
         for cls_name in sorted(by_file_cls[tfile]):
             if stop or time.monotonic() >= soft_deadline_s:
                 break
-            methods = sorted(by_file_cls[tfile][cls_name], key=lambda item: (ms_by_num[item[0]], item[0]))
+            methods = sorted(
+                (item for item in by_file_cls[tfile][cls_name] if item[0] in pending),
+                key=lambda item: (ms_by_num[item[0]], item[0]),
+            )
+            if not methods:
+                continue
             cls = getattr(mod, cls_name, None) if cls_name else None
             if cls is None or not isinstance(cls, type) or not issubclass(cls, unittest.TestCase):
                 for test_num, _meth, test_id in methods:
+                    if test_num not in pending:
+                        continue
                     if time.monotonic() >= soft_deadline_s:
                         break
                     try:
@@ -1294,6 +1452,7 @@ def _child_execute(
                         passed.append(test_num)
                     else:
                         kept.add(test_num)
+                        actual_failures.add(test_num)
                     if should_stop_ordinary():
                         stop = True
                         break
@@ -1363,6 +1522,7 @@ def _child_execute(
                     mod.TPCH_SCHEMA = orig_tpch_schema
                 failed_class = {n for n, _, _ in methods}
                 kept.update(failed_class)
+                actual_failures.update(failed_class)
                 pending.difference_update(failed_class)
                 stop = should_stop_ordinary()
                 if stop:
@@ -1373,15 +1533,16 @@ def _child_execute(
             teardown_failed = False
             try:
                 for test_num, meth_name, _test_id in methods:
+                    if test_num not in pending:
+                        continue
                     now_t = time.monotonic()
                     if now_t >= soft_deadline_s:
                         break
                     if (
                         (passed or cls_passed)
                         and ms_by_num[test_num] >= 500
-                        and now_t + (ms_by_num[test_num] / 1000.0) * 1.5 >= soft_deadline_s
+                        and now_t + (ms_by_num[test_num] / 1000.0) * 0.9 + 2.0 >= soft_deadline_s
                     ):
-                        stop = True
                         break
                     res = _FailFastResult()
                     try:
@@ -1396,6 +1557,7 @@ def _child_execute(
                         cls_passed.append(test_num)
                     else:
                         kept.add(test_num)
+                        actual_failures.add(test_num)
                     if should_stop_ordinary():
                         stop = True
                         break
@@ -1418,12 +1580,136 @@ def _child_execute(
                     if getattr(cls, "tearDown_exceptions", None):
                         teardown_failed = True
             if not teardown_failed:
-                passed.extend(cls_passed)
+                if cls_passed:
+                    passed.extend(cls_passed)
+                    emit_checkpoint()
             else:
                 kept.update(cls_passed)
+                actual_failures.update(cls_passed)
                 stop = should_stop_ordinary()
             if stop:
                 break
+
+    if deferred_specs:
+        # Flush already-passed ordinary tests before entering long deferred tests so a SIGKILL
+        # during deferred execution cannot discard completed ordinary results.
+        if passed or import_error_files:
+            emit_checkpoint()
+
+        unrun_ordinary = pending - deferred_nums
+        remaining_deferred = set(deferred_nums)
+        for dh_num, dh_id in deferred_specs:
+            now_t = time.monotonic()
+            if now_t >= soft_deadline_s or (batch_deadline - now_t) < deferred_heavy_min_headroom_s:
+                break
+            if import_error_files:
+                break
+            if actual_failures and (
+                len(actual_failures) > DEFERRED_HEAVY_MAX_KEPT_TESTS
+                or max(ms_by_num[t] for t in actual_failures) > DEFERRED_HEAVY_MAX_KEPT_TEST_MS
+            ):
+                break
+            if dh_id == _TEST_EXECUTE_TPCDS_ID and any(
+                file_by_num.get(t) == "tests/test_executor.py" for t in actual_failures
+            ):
+                remaining_deferred.discard(dh_num)
+                kept.add(dh_num)
+                continue
+
+            effective_kept = kept | unrun_ordinary
+            sim_with = compute_commit_cost_ms(
+                schedule_tests(effective_kept | remaining_deferred, ms_by_num), ms_by_num
+            )
+            sim_without = compute_commit_cost_ms(
+                schedule_tests(effective_kept, ms_by_num), ms_by_num
+            )
+            est_deferred = sum(_deferred_heavy_cpu_ms(t, id_by_num) for t in remaining_deferred)
+            if (sim_with - sim_without) < int(est_deferred * RESIDUAL_ROI_RATIO):
+                break
+
+            parts = dh_id.split("::")
+            tfile = parts[0]
+            cls_name = parts[1] if len(parts) == 3 else ""
+            meth_name = parts[2] if len(parts) == 3 else parts[-1]
+            if (
+                tfile in ("tests/test_optimizer.py", "tests/test_executor.py")
+                and can_lazy_optimizer_setup
+                and can_filter_executor_setup
+            ):
+                _install_lazy_heavy_deps()
+            mod_name = tfile[:-3].replace("/", ".")
+            try:
+                mod = importlib.import_module(mod_name)
+            except BaseException:
+                import_error_files.append(tfile)
+                kept.add(dh_num)
+                actual_failures.add(dh_num)
+                pending.discard(dh_num)
+                remaining_deferred.discard(dh_num)
+                continue
+
+            cls = getattr(mod, cls_name, None) if cls_name else None
+            dh_ok = False
+            if cls is None or not isinstance(cls, type) or not issubclass(cls, unittest.TestCase):
+                try:
+                    dh_ok = _run_pytest_fallback(dh_id)
+                except BaseException:
+                    dh_ok = False
+            else:
+                orig_tpch_schema = None
+                if (
+                    can_filter_executor_setup
+                    and tfile == "tests/test_executor.py"
+                    and cls_name == "TestExecutor"
+                    and hasattr(mod, "TPCH_SCHEMA")
+                ):
+                    orig_tpch_schema = mod.TPCH_SCHEMA
+                    mod.TPCH_SCHEMA = {}
+                if hasattr(cls, "tearDown_exceptions"):
+                    cls.tearDown_exceptions = []
+                setup_ok = True
+                try:
+                    if hasattr(cls, "setUpClass"):
+                        cls.setUpClass()
+                except BaseException:
+                    setup_ok = False
+                if setup_ok:
+                    res = _FailFastResult()
+                    teardown_failed = False
+                    try:
+                        tc = cls(meth_name)
+                        tc.run(res)
+                    except _SubtestAbort:
+                        res.failed = True
+                    except BaseException:
+                        res.failed = True
+                    finally:
+                        if orig_tpch_schema is not None:
+                            mod.TPCH_SCHEMA = orig_tpch_schema
+                        try:
+                            if hasattr(cls, "tearDownClass"):
+                                cls.tearDownClass()
+                        except BaseException:
+                            teardown_failed = True
+                        try:
+                            if hasattr(cls, "doClassCleanups"):
+                                cls.doClassCleanups()
+                        except BaseException:
+                            teardown_failed = True
+                        if getattr(cls, "tearDown_exceptions", None):
+                            teardown_failed = True
+                    dh_ok = not res.failed and not teardown_failed
+                elif orig_tpch_schema is not None:
+                    mod.TPCH_SCHEMA = orig_tpch_schema
+
+            pending.discard(dh_num)
+            remaining_deferred.discard(dh_num)
+            if dh_ok:
+                passed.append(dh_num)
+                emit_checkpoint()
+            else:
+                kept.add(dh_num)
+                actual_failures.add(dh_num)
 
     ru_self = resource.getrusage(resource.RUSAGE_SELF)
     ru_kids = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -1464,6 +1750,30 @@ class _RunningJob:
     candidates: frozenset[int]
 
 
+def _parse_last_child_payload(buf: bytearray) -> dict[str, Any] | None:
+    if not buf:
+        return None
+    text = buf.decode("utf-8", errors="replace")
+    if "\n" not in text:
+        try:
+            parsed = json.loads(text)
+            return parsed if isinstance(parsed, dict) else None
+        except ValueError:
+            return None
+    # Only parse newline-terminated frames so a partial write during SIGKILL is never read.
+    lines = text.split("\n")[:-1]
+    for line in reversed(lines):
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError:
+            continue
+    return None
+
+
 def _run_fork_queue(
     queue: list[tuple[str, CommitAnalysis, frozenset[int], VerifyPlan]],
     outcomes: dict[str, VerifyOutcome],
@@ -1479,6 +1789,15 @@ def _run_fork_queue(
 ) -> None:
     if not queue:
         return
+
+    queue = sorted(
+        queue,
+        key=lambda item: (
+            bool(item[3].deferred_heavy),
+            -(item[3].max_sim_gain_ms - item[3].est_cpu_ms),
+            item[0],
+        ),
+    )
 
     sqlglot_root_str = str(sqlglot_root)
     active: list[_RunningJob] = []
@@ -1497,6 +1816,8 @@ def _run_fork_queue(
             commit_cap = per_commit_timeout_s + (
                 FAST_TPCDS_EXTRA_TIMEOUT_S if plan.fast_tpcds else 0.0
             )
+            if plan.deferred_heavy and per_commit_timeout_s >= PER_COMMIT_WALL_TIMEOUT_S:
+                commit_cap = max(commit_cap, DEFERRED_HEAVY_WALL_TIMEOUT_S)
             timeout_s = min(commit_cap, remaining_batch - 0.5)
             overlay_dir = create_overlay(sqlglot_root, analysis.patched_contents, tmp_base=tmp_base)
             test_specs = [(n, id_by_num[n]) for n in sorted(plan.to_verify)]
@@ -1527,8 +1848,11 @@ def _run_fork_queue(
                         patched_files=patched_files,
                         fast_tpcds=plan.fast_tpcds,
                         tpcds_plan_hashes=tpcds_plan_hashes,
+                        deferred_heavy=plan.deferred_heavy,
+                        batch_deadline=batch_deadline,
+                        checkpoint_fd=w_fd,
                     )
-                    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                    raw = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
                     view = memoryview(raw)
                     written = 0
                     while written < len(view):
@@ -1557,6 +1881,14 @@ def _run_fork_queue(
 
     def finalize_job(job: _RunningJob, timed_out: bool) -> None:
         wall_s = time.monotonic() - job.start_t
+        while True:
+            try:
+                chunk = os.read(job.r_fd, 65536)
+                if not chunk:
+                    break
+                job.buf.extend(chunk)
+            except (BlockingIOError, OSError):
+                break
         try:
             os.close(job.r_fd)
         except OSError:
@@ -1569,7 +1901,8 @@ def _run_fork_queue(
                 timed_out = True
         shutil.rmtree(job.overlay_dir, ignore_errors=True)
 
-        if timed_out or not job.buf:
+        data = _parse_last_child_payload(job.buf)
+        if data is None:
             outcomes[job.commit_id] = VerifyOutcome(
                 final_tests=job.candidates,
                 verified=True,
@@ -1577,19 +1910,6 @@ def _run_fork_queue(
                 child_cpu_s=0.0,
                 wall_s=wall_s,
                 timed_out=timed_out,
-            )
-            return
-
-        try:
-            data = json.loads(job.buf.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
-            outcomes[job.commit_id] = VerifyOutcome(
-                final_tests=job.candidates,
-                verified=True,
-                shed_count=0,
-                child_cpu_s=0.0,
-                wall_s=wall_s,
-                timed_out=False,
             )
             return
 
@@ -1608,7 +1928,7 @@ def _run_fork_queue(
             shed_count=len(job.candidates - final_set),
             child_cpu_s=float(data.get("cpu_s", 0.0)),
             wall_s=wall_s,
-            timed_out=False,
+            timed_out=timed_out,
         )
 
     try:

@@ -1417,10 +1417,10 @@ def test_verifier_early_exit_preserves_unverified_and_failed_tests(tmp_path: Pat
     tmp_ov = tmp_path / "ee_ov"
     tmp_ov.mkdir()
 
-    # Failure-triggered early exit: test 0 (10ms) runs first and fails; remaining tests 1+2 (160ms)
-    # yield residual gain 160ms < MIN_RESIDUAL_GAIN_MS, so verification stops immediately and keeps
+    # Failure-triggered early exit: test 0 (10ms) runs first and fails; remaining tests 1+2 (100ms)
+    # yield residual gain 100ms < MIN_RESIDUAL_GAIN_MS, so verification stops immediately and keeps
     # both the failed test AND all unverified tests.
-    ms_by_num = {0: 10, 1: 80, 2: 80, 3: 15_000}
+    ms_by_num = {0: 10, 1: 50, 2: 50, 3: 15_000}
     id_by_num = {
         0: "tests/test_early.py::TestEarly::test_fast_fail",
         1: "tests/test_early.py::TestEarly::test_slow_unrun_fail",
@@ -1586,4 +1586,234 @@ def test_ordinary_failure_skips_remaining_ordinary_but_still_runs_fast_tpcds(
     assert outcomes_fail["c_jump_fail"].final_tests == frozenset({0, 1, 1106})
     assert not marker.exists()
     assert tpcds_called.read_text(encoding="utf-8") == "failed"
+    assert list(tmp_ov.iterdir()) == []
+
+
+def test_deferred_heavy_conditional_execution_and_timeout_checkpoint(tmp_path: Path) -> None:
+    import verifier
+
+    repo = tmp_path / "dh_repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    marker = tmp_path / "dh.log"
+    (repo / "tests" / "test_parser.py").write_text(
+        textwrap.dedent(
+            f"""\
+            import time
+            import unittest
+            from pathlib import Path
+
+            MARKER = Path({str(marker)!r})
+
+            class TestParser(unittest.TestCase):
+                def test_ord_pass(self):
+                    with MARKER.open("a", encoding="utf-8") as fh:
+                        fh.write("ord_pass\\n")
+                    self.assertTrue(True)
+
+                def test_ord_fail_0(self):
+                    with MARKER.open("a", encoding="utf-8") as fh:
+                        fh.write("ord_fail_0\\n")
+                    self.fail("boom")
+
+                def test_ord_fail_1(self):
+                    self.fail("boom")
+
+                def test_ord_fail_2(self):
+                    self.fail("boom")
+
+                def test_ord_fail_3(self):
+                    self.fail("boom")
+
+                def test_ord_fail_4(self):
+                    self.fail("boom")
+
+                def test_ord_fail_5(self):
+                    self.fail("boom")
+
+                def test_max_nodes(self):
+                    with MARKER.open("a", encoding="utf-8") as fh:
+                        fh.write("max_nodes\\n")
+                    if Path("tests/sleep_heavy.flag").exists():
+                        time.sleep(5)
+                    self.assertTrue(True)
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    tmp_ov = tmp_path / "dh_ov"
+    tmp_ov.mkdir()
+
+    ms_by_num = {
+        0: 500,
+        1: 500,
+        2: 500,
+        3: 500,
+        4: 500,
+        5: 500,
+        6: 500,
+        1490: 28_817,
+    }
+    id_by_num = {
+        0: "tests/test_parser.py::TestParser::test_ord_pass",
+        1: "tests/test_parser.py::TestParser::test_ord_fail_0",
+        2: "tests/test_parser.py::TestParser::test_ord_fail_1",
+        3: "tests/test_parser.py::TestParser::test_ord_fail_2",
+        4: "tests/test_parser.py::TestParser::test_ord_fail_3",
+        5: "tests/test_parser.py::TestParser::test_ord_fail_4",
+        6: "tests/test_parser.py::TestParser::test_ord_fail_5",
+        1490: "tests/test_parser.py::TestParser::test_max_nodes",
+    }
+    file_by_num = {n: "tests/test_parser.py" for n in ms_by_num}
+    file_to_tests = {"tests/test_parser.py": frozenset(ms_by_num)}
+
+    an = CommitAnalysis("c_dh", patched_contents={})
+
+    # 1. Ordinary tests fail broadly (6 failures > DEFERRED_HEAVY_MAX_KEPT_TESTS) -> skip #1490
+    broad_cands = frozenset({1, 2, 3, 4, 5, 6, 1490})
+    broad_plan = verifier.plan_commit_verification(
+        broad_cands, ms_by_num, file_by_num, analysis=an, id_by_num=id_by_num
+    )
+    assert broad_plan.should_verify is True
+    assert broad_plan.deferred_heavy == frozenset({1490})
+    broad_out: dict = {}
+    verifier._run_fork_queue(
+        [("c_broad", an, broad_cands, broad_plan)],
+        broad_out,
+        repo,
+        id_by_num,
+        file_to_tests,
+        (),
+        10.0,
+        10**9,
+        1,
+        str(tmp_ov),
+        ms_by_num,
+    )
+    assert broad_out["c_broad"].final_tests == broad_cands
+    assert "max_nodes" not in marker.read_text(encoding="utf-8").splitlines()
+
+    # 2. Ordinary tests pass -> #1490 runs and sheds cleanly
+    marker.unlink()
+    pass_cands = frozenset({0, 1490})
+    pass_plan = verifier.plan_commit_verification(
+        pass_cands, ms_by_num, file_by_num, analysis=an, id_by_num=id_by_num
+    )
+    assert pass_plan.should_verify is True
+    assert pass_plan.deferred_heavy == frozenset({1490})
+    pass_out: dict = {}
+    verifier._run_fork_queue(
+        [("c_pass", an, pass_cands, pass_plan)],
+        pass_out,
+        repo,
+        id_by_num,
+        file_to_tests,
+        (),
+        10.0,
+        10**9,
+        1,
+        str(tmp_ov),
+        ms_by_num,
+    )
+    assert pass_out["c_pass"].final_tests == frozenset()
+    assert marker.read_text(encoding="utf-8").splitlines() == ["ord_pass", "max_nodes"]
+
+    # 3. Timeout during deferred heavy test still preserves checkpointed passed ordinary tests
+    marker.unlink()
+    an_sleep = CommitAnalysis("c_sleep", patched_contents={"tests/sleep_heavy.flag": "1\n"})
+    sleep_out: dict = {}
+    verifier._run_fork_queue(
+        [("c_sleep", an_sleep, pass_cands, pass_plan)],
+        sleep_out,
+        repo,
+        id_by_num,
+        file_to_tests,
+        (),
+        1.5,
+        10**9,
+        1,
+        str(tmp_ov),
+        ms_by_num,
+    )
+    assert sleep_out["c_sleep"].timed_out is True
+    assert sleep_out["c_sleep"].final_tests == frozenset({1490})
+    assert list(tmp_ov.iterdir()) == []
+
+
+def test_partial_heavy_outlier_subset_plan_keeps_cheap_tests_conservatively(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import verifier
+
+    # 600 cheap tests (200ms each, different files) would blow PER_COMMIT_EST_CPU_CAP_MS / ROI
+    # under full verification, so plan_commit_verification selects the Heavy-Outlier Subset Plan
+    # (fast #1106 + heavy #1224) and keeps all 600 cheap tests unverified (zero misses).
+    ms_by_num: dict[int, int] = {1106: 21_454, 1224: 6_686}
+    id_by_num: dict[int, str] = {
+        1106: "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+        1224: "tests/test_generator.py::TestGenerator::test_generator_memory",
+    }
+    file_by_num: dict[int, str] = {
+        1106: "tests/test_executor.py",
+        1224: "tests/test_generator.py",
+    }
+    for i in range(600):
+        ms_by_num[i] = 10
+        tfile = f"tests/test_cheap_{i}.py"
+        id_by_num[i] = f"{tfile}::TestCheap::test_{i}"
+        file_by_num[i] = tfile
+
+    cands = frozenset(ms_by_num)
+    an = CommitAnalysis("c_giant", patched_contents={})
+    plan = verifier.plan_commit_verification(
+        cands,
+        ms_by_num,
+        file_by_num,
+        analysis=an,
+        id_by_num=id_by_num,
+        tpcds_plan_hashes=("dummy_hash",),
+        tpcds_exec_lines={"sqlglot/other.py": frozenset({1})},
+    )
+    assert plan.should_verify is True
+    assert plan.fast_tpcds is True
+    assert {1106, 1224}.issubset(plan.to_verify)
+    assert plan.keep_unverified == frozenset(range(600))
+    assert plan.to_verify | plan.keep_unverified == cands
+
+    # Execute the partial subset plan: #1106 and #1224 pass and shed; all 600 cheap tests remain kept
+    repo = tmp_path / "subset_repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "tests" / "test_generator.py").write_text(
+        textwrap.dedent(
+            """\
+            import unittest
+
+            class TestGenerator(unittest.TestCase):
+                def test_generator_memory(self):
+                    self.assertTrue(True)
+            """
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(verifier, "_fast_verify_tpcds", lambda hashes, deadline: True)
+    tmp_ov = tmp_path / "sub_ov"
+    tmp_ov.mkdir()
+    out: dict = {}
+    verifier._run_fork_queue(
+        [("c_giant", an, cands, plan)],
+        out,
+        repo,
+        id_by_num,
+        {"tests/test_generator.py": frozenset({1224})},
+        ("dummy_hash",),
+        10.0,
+        10**9,
+        1,
+        str(tmp_ov),
+        ms_by_num,
+    )
+    assert out["c_giant"].final_tests == frozenset(range(600))
+    assert out["c_giant"].shed_count == 2
     assert list(tmp_ov.iterdir()) == []
